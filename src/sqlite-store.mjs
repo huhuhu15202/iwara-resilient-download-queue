@@ -129,6 +129,9 @@ export class SQLiteStore {
       if (!columns.has(name)) this.db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${definition}`);
     }
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_state_media ON tasks(state, media_status, watched, updated_at DESC)");
+    // The default playlist sort is recent-first.  Keep its ordering in the
+    // same index so a page request does not build a temporary sort table.
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_playlist_recent ON tasks(state, media_status, updated_at DESC, id ASC)");
     this.backfillIndexedFields();
 
     const count = Number(this.db.prepare("SELECT COUNT(*) AS count FROM tasks").get().count);
@@ -343,7 +346,7 @@ export class SQLiteStore {
   queryPlaylist({
     query = "", author = "all", watched = "all", sort = "updatedAt",
     direction = "desc", page = 1, pageSize = 30, randomPage = false,
-    contextId = "", contextSize = 5
+    contextId = "", contextIndex = null, contextSize = 5
   } = {}) {
     const where = ["state='completed'", "media_status='present'", "COALESCE(json_extract(data_json, '$.destination'), '')<>''"];
     const params = [];
@@ -371,9 +374,32 @@ export class SQLiteStore {
     const safePageSize = Math.min(60, Math.max(6, Number(pageSize) || 30));
     let safePage = Math.max(1, Number(page) || 1);
     let currentIndex = null;
+    let globalIndex = null;
+    let hasPrevious = false;
+    let hasNext = false;
     let offset = (safePage - 1) * safePageSize;
-    if (contextId) {
-      const center = this.db.prepare(`SELECT ${orderColumn} AS order_value, id FROM tasks ${clause} AND id=?`).get(...params, contextId);
+    const hasContextIndex = contextIndex !== null && contextIndex !== undefined && String(contextIndex) !== "";
+    const parsedContextIndex = Number(contextIndex);
+    const requestedContextIndex = hasContextIndex && Number.isSafeInteger(parsedContextIndex)
+      ? parsedContextIndex
+      : null;
+    if (contextId || requestedContextIndex !== null) {
+      let center;
+      if (requestedContextIndex !== null) {
+        const target = Math.max(0, Math.min(total - 1, requestedContextIndex));
+        if (total > 0) {
+          const size = Math.min(9, Math.max(2, Number(contextSize) || 5));
+          offset = Math.max(0, Math.min(target - Math.floor(size / 2), Math.max(0, total - size)));
+          currentIndex = target - offset;
+          globalIndex = target;
+          hasPrevious = target > 0;
+          hasNext = target < total - 1;
+          safePage = 1;
+          const rows = this.db.prepare(`SELECT data_json FROM tasks ${clause} ORDER BY ${orderColumn} ${order}, id ${tieOrder} LIMIT ? OFFSET ?`).all(...params, size, offset);
+          return { total, page: safePage, pageSize: size, currentIndex, globalIndex, hasPrevious, hasNext, tasks: rows.map(row => JSON.parse(row.data_json)) };
+        }
+      }
+      center = this.db.prepare(`SELECT ${orderColumn} AS order_value, id FROM tasks ${clause} AND id=?`).get(...params, contextId);
       if (center) {
         const comparator = order === "ASC"
           ? `(${orderColumn} < ? OR (${orderColumn} = ? AND id < ?))`
@@ -382,17 +408,20 @@ export class SQLiteStore {
         const size = Math.min(9, Math.max(2, Number(contextSize) || 5));
         offset = Math.max(0, Math.min(before - Math.floor(size / 2), Math.max(0, total - size)));
         currentIndex = before - offset;
+        globalIndex = before;
+        hasPrevious = before > 0;
+        hasNext = before < total - 1;
         safePage = 1;
         const rows = this.db.prepare(`SELECT data_json FROM tasks ${clause} ORDER BY ${orderColumn} ${order}, id ${tieOrder} LIMIT ? OFFSET ?`).all(...params, size, offset);
-        return { total, page: safePage, pageSize: size, currentIndex, tasks: rows.map(row => JSON.parse(row.data_json)) };
+        return { total, page: safePage, pageSize: size, currentIndex, globalIndex, hasPrevious, hasNext, tasks: rows.map(row => JSON.parse(row.data_json)) };
       }
-      return { total, page: 1, pageSize: Math.min(9, Math.max(2, Number(contextSize) || 5)), currentIndex: null, tasks: [] };
+      return { total, page: 1, pageSize: Math.min(9, Math.max(2, Number(contextSize) || 5)), currentIndex: null, globalIndex: null, hasPrevious: false, hasNext: false, tasks: [] };
     }
     const pageCount = Math.max(1, Math.ceil(total / safePageSize));
     safePage = randomPage ? 1 + Math.floor(Math.random() * pageCount) : Math.min(pageCount, safePage);
     offset = (safePage - 1) * safePageSize;
     const rows = this.db.prepare(`SELECT data_json FROM tasks ${clause} ORDER BY ${orderColumn} ${order}, id ${tieOrder} LIMIT ? OFFSET ?`).all(...params, safePageSize, offset);
-    return { total, page: safePage, pageSize: safePageSize, currentIndex, tasks: rows.map(row => JSON.parse(row.data_json)) };
+    return { total, page: safePage, pageSize: safePageSize, currentIndex, globalIndex, hasPrevious: offset > 0, hasNext: offset + rows.length < total, tasks: rows.map(row => JSON.parse(row.data_json)) };
   }
 
   counts() {

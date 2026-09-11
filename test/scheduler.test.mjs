@@ -365,7 +365,14 @@ describe("scheduler state transitions", () => {
       const result = await current.playlist({ contextId: "task-3", contextSize: 5 });
       assert.equal(result.items.length, 5);
       assert.equal(result.currentIndex, 2);
+      assert.equal(result.globalIndex, 3);
+      assert.equal(result.hasPrevious, true);
+      assert.equal(result.hasNext, true);
       assert.ok(result.items.some(item => item.id === "task-3"));
+      const nextContext = await current.playlist({ contextIndex: 4, contextSize: 5, direction: "asc" });
+      assert.equal(nextContext.globalIndex, 4);
+      assert.equal(nextContext.currentIndex, 2);
+      assert.equal(nextContext.items[2].id, "task-4");
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
@@ -389,9 +396,16 @@ describe("scheduler state transitions", () => {
         aria2: aria2(),
         config: { downloadRoot: root, maxConcurrentTasks: 3 }
       });
+      current.mediaPath = async () => { throw new Error("playlist must use cached media status"); };
       const result = await current.playlist({ page: 1, pageSize: 30 });
       assert.equal(result.total, 1);
       assert.equal(result.items[0].id, "cached-task");
+      assert.equal(result.hasPrevious, false);
+      assert.equal(result.hasNext, false);
+      const context = await current.playlist({ contextIndex: 0, contextSize: 5 });
+      assert.equal(context.globalIndex, 0);
+      assert.equal(context.currentIndex, 0);
+      assert.equal(context.items[0].id, "cached-task");
       await current.updatePlayback("cached-task", { position: 37.5, duration: 120, watched: false });
       assert.equal(currentTask.playbackPosition, 37.5);
       assert.equal(currentTask.watched, false);
@@ -411,6 +425,26 @@ describe("scheduler state transitions", () => {
       sqlite?.close();
       await rm(root, { recursive: true, force: true });
     }
+  });
+
+  test("background media reconcile checks only a bounded batch", async () => {
+    const root = await tempRoot();
+    try {
+      const file = path.join(root, "reconcile.mp4");
+      await writeFile(file, Buffer.concat([Buffer.from([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70]), Buffer.alloc(2048)]));
+      const tasks = [
+        task({ id: "reconcile-1", videoId: "reconcile-video-1", state: "completed", destination: file, fileStatus: "present", actualFileSize: "2056" }),
+        task({ id: "reconcile-2", videoId: "reconcile-video-2", state: "completed", destination: path.join(root, "missing.mp4"), fileStatus: "present" })
+      ];
+      const { current, currentStore } = scheduler(tasks, { root, downloadRoot: root, mediaReconcileBatchSize: 1 });
+      await rm(file, { force: true });
+      const result = await current.reconcileMediaBatch();
+      assert.equal(result.checked, 1);
+      assert.equal(result.changed, 1);
+      assert.equal(tasks[0].fileStatus, "missing");
+      assert.equal(tasks[1].fileStatus, "present");
+      assert.equal(currentStore.saves, 1);
+    } finally { await rm(root, { recursive: true, force: true }); }
   });
 
   test("moveFileSafely handles a normal rename", async () => {

@@ -358,9 +358,9 @@ export class Scheduler {
     let changed = 0;
     for (let index = 0; index < Math.min(batchSize, completed.length); index += 1) {
       const task = completed[(this.reconcileCursor + index) % completed.length];
-      const before = `${task.fileStatus}|${task.actualFileSize}|${task.destination}`;
+      const before = `${task.fileStatus}|${task.actualFileSize}|${task.destination}|${task.mediaCheckedAt || ""}`;
       await this.verifyCompletedTask(task);
-      if (before !== `${task.fileStatus}|${task.actualFileSize}|${task.destination}`) changed += 1;
+      if (before !== `${task.fileStatus}|${task.actualFileSize}|${task.destination}|${task.mediaCheckedAt || ""}`) changed += 1;
     }
     this.reconcileCursor = (this.reconcileCursor + Math.min(batchSize, completed.length)) % completed.length;
     if (changed) await this.store.save();
@@ -1235,10 +1235,10 @@ export class Scheduler {
     return { ...result, tasks: result.tasks.map(publicTask), authors: this.store.authors?.() || [] };
   }
 
-  async playlist({ query = "", author = "all", watched = "all", taskId = "", contextId = "", contextSize = 5, sort = "updatedAt", direction = "desc", page = 1, pageSize = 25, randomPage = false } = {}) {
+  async playlist({ query = "", author = "all", watched = "all", taskId = "", contextId = "", contextIndex = null, contextSize = 5, sort = "updatedAt", direction = "desc", page = 1, pageSize = 25, randomPage = false } = {}) {
     if (this.store.queryPlaylist) {
       const result = this.store.queryPlaylist({
-        query, author, watched, sort, direction, page, pageSize, randomPage, contextId, contextSize
+        query, author, watched, sort, direction, page, pageSize, randomPage, contextId, contextIndex, contextSize
       });
       let playerError = null;
       if (contextId && !result.currentIndex && result.currentIndex !== 0) {
@@ -1261,7 +1261,17 @@ export class Scheduler {
         viewsUpdatedAt: task.viewsUpdatedAt || null,
         localFileName: path.basename(task.destination)
       }));
-      return { total: result.total, page: result.page, pageSize: result.pageSize, currentIndex: result.currentIndex, items, playerError };
+      return {
+        total: result.total,
+        page: result.page,
+        pageSize: result.pageSize,
+        currentIndex: result.currentIndex,
+        globalIndex: result.globalIndex ?? null,
+        hasPrevious: Boolean(result.hasPrevious),
+        hasNext: Boolean(result.hasNext),
+        items,
+        playerError
+      };
     }
     const needle = String(query || "").trim().toLocaleLowerCase();
     const matches = [];
@@ -1309,8 +1319,15 @@ export class Scheduler {
       : Math.min(pageCount, Math.max(1, Number(page) || 1));
     let selected = matches.slice((safePage - 1) * safePageSize, safePage * safePageSize);
     let currentIndex = null;
-    if (contextId) {
-      const center = matches.findIndex(task => task.id === contextId);
+    let globalIndex = null;
+    let hasPrevious = false;
+    let hasNext = false;
+    const requestedContextIndex = contextIndex !== null && contextIndex !== undefined && String(contextIndex) !== ""
+      && Number.isSafeInteger(Number(contextIndex)) ? Number(contextIndex) : null;
+    if (contextId || requestedContextIndex !== null) {
+      const center = requestedContextIndex !== null
+        ? Math.max(0, Math.min(matches.length - 1, requestedContextIndex))
+        : matches.findIndex(task => task.id === contextId);
       const size = Math.min(9, Math.max(2, Number(contextSize) || 5));
       if (center < 0) {
         selected = [];
@@ -1318,6 +1335,9 @@ export class Scheduler {
         const start = Math.max(0, Math.min(center - Math.floor(size / 2), matches.length - size));
         selected = matches.slice(start, start + size);
         currentIndex = center - start;
+        globalIndex = center;
+        hasPrevious = center > 0;
+        hasNext = center < matches.length - 1;
       }
     }
     const items = selected
@@ -1328,7 +1348,7 @@ export class Scheduler {
         viewsUpdatedAt: task.viewsUpdatedAt || null,
         localFileName: path.basename(task.destination)
       }));
-    return { total: matches.length, page: safePage, pageSize: safePageSize, currentIndex, items };
+    return { total: matches.length, page: safePage, pageSize: safePageSize, currentIndex, globalIndex, hasPrevious, hasNext, items };
   }
 
   async updatePlayback(taskId, payload = {}) {
