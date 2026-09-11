@@ -10,9 +10,13 @@ import { FfmpegDownloader } from "./ffmpeg-downloader.mjs";
 import { createServer } from "./server.mjs";
 
 const appRoot = path.resolve(import.meta.dirname, "..");
-const dataRoot = "F:\\IwaraVideos\\R18\\ServiceData";
-const configPath = path.join(dataRoot, "config.json");
+const defaultDataRoot = "F:\\IwaraVideos\\R18\\ServiceData";
+const defaultDownloadRoot = "F:\\Video";
 const defaultEngine = "C:\\Program Files\\MotrixNext\\motrix-next-engine.exe";
+const configOverride = String(process.env.IWARA_CONFIG_PATH || "").trim()
+  ? path.resolve(String(process.env.IWARA_CONFIG_PATH).trim())
+  : "";
+const envValue = name => String(process.env[name] || "").trim();
 
 async function exists(filePath) {
   try {
@@ -24,14 +28,14 @@ async function exists(filePath) {
 }
 
 async function loadConfig() {
-  await mkdir(dataRoot, { recursive: true });
   const defaults = {
+    dataRoot: envValue("IWARA_DATA_ROOT") || defaultDataRoot,
+    downloadRoot: envValue("IWARA_DOWNLOAD_ROOT") || defaultDownloadRoot,
+    enginePath: envValue("IWARA_ENGINE_PATH") || defaultEngine,
     serviceHost: "127.0.0.1",
     servicePort: 18777,
     aria2Port: 16801,
     aria2Secret: randomBytes(18).toString("hex"),
-    enginePath: defaultEngine,
-    downloadRoot: "F:\\Video",
     maxAttempts: 6,
     maxConcurrentTasks: 3,
     retryDelayMs: 3000,
@@ -45,18 +49,46 @@ async function loadConfig() {
     minValidMediaBytes: 65536,
     ffmpegPath: ""
   };
-  try {
-    const current = JSON.parse(await readFile(configPath, "utf8"));
-    const merged = { ...defaults, ...current };
-    if (Object.keys(defaults).some(key => !(key in current))) {
-      await writeFile(configPath, JSON.stringify(merged, null, 2), "utf8");
+  const candidates = configOverride
+    ? [configOverride]
+    : [path.join(appRoot, "config.json"), path.join(defaults.dataRoot, "config.json")];
+  let configPath = configOverride || path.join(appRoot, "config.json");
+  let current = {};
+  for (const candidate of candidates) {
+    try {
+      current = JSON.parse(await readFile(candidate, "utf8"));
+      configPath = candidate;
+      break;
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
     }
-    return merged;
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
-    await writeFile(configPath, JSON.stringify(defaults, null, 2), "utf8");
-    return defaults;
   }
+  const merged = { ...defaults, ...(current && typeof current === "object" ? current : {}) };
+  const envOverrides = {
+    dataRoot: "IWARA_DATA_ROOT",
+    downloadRoot: "IWARA_DOWNLOAD_ROOT",
+    enginePath: "IWARA_ENGINE_PATH",
+    serviceHost: "IWARA_SERVICE_HOST",
+    ffmpegPath: "IWARA_FFMPEG_PATH"
+  };
+  for (const [key, name] of Object.entries(envOverrides)) {
+    const value = envValue(name);
+    if (value) merged[key] = value;
+  }
+  for (const [key, name] of [["servicePort", "IWARA_SERVICE_PORT"], ["aria2Port", "IWARA_ARIA2_PORT"]]) {
+    const value = Number(envValue(name));
+    if (Number.isInteger(value) && value > 0) merged[key] = value;
+  }
+  merged.dataRoot = path.resolve(appRoot, String(merged.dataRoot || defaultDataRoot));
+  merged.downloadRoot = path.resolve(appRoot, String(merged.downloadRoot || defaultDownloadRoot));
+  merged.enginePath = path.resolve(appRoot, String(merged.enginePath || defaultEngine));
+  await mkdir(merged.dataRoot, { recursive: true });
+  await mkdir(path.dirname(configPath), { recursive: true });
+  const missingDefault = Object.keys(defaults).some(key => !(key in current));
+  if (!Object.keys(current).length || missingDefault) {
+    await writeFile(configPath, JSON.stringify(merged, null, 2), "utf8");
+  }
+  return merged;
 }
 
 async function waitForAria2(client, timeoutMs = 12000) {
@@ -73,6 +105,7 @@ async function waitForAria2(client, timeoutMs = 12000) {
 
 async function main() {
   const config = await loadConfig();
+  const dataRoot = config.dataRoot;
   if (!await exists(config.enginePath)) {
     throw new Error(`找不到 Motrix Next 下载内核：${config.enginePath}`);
   }

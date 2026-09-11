@@ -1,0 +1,13 @@
+{
+  "dataRoot": "F:\\IwaraVideos\\R18\\ServiceData",
+  "downloadRoot": "F:\\Video",
+  "enginePath": "C:\\Program Files\\MotrixNext\\motrix-next-engine.exe",
+  "serviceHost": "127.0.0.1",
+  "servicePort": 18777,
+  "aria2Port": 16801,
+  "maxAttempts": 6,
+  "maxConcurrentTasks": 3,
+  "browserFallbackEnabled": true,
+  "browserFallbackTimeoutMs": 45000,
+  "minValidMediaBytes": 65536
+}

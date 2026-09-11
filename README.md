@@ -12,15 +12,21 @@
 
 ## 使用
 
-1. 安装 Node.js 18+、Aria2（或 Motrix Next）。
-2. 按本机目录修改 `src/main.mjs` 中的 `dataRoot` 和 `downloadRoot`。
-3. 双击 `启动稳定下载.cmd`。
+1. 安装 Node.js >= 22.13.0（推荐当前 Node.js 24 LTS）、Aria2（或 Motrix Next）。`node:sqlite` 在 Node 22.5.0 才加入，Node 22.13.0 起无需实验参数。
+2. 复制 `config.example.json` 为程序目录下的 `config.json`，按本机目录填写 `dataRoot`、`downloadRoot` 和 `enginePath`；也可以使用 `IWARA_DATA_ROOT`、`IWARA_DOWNLOAD_ROOT`、`IWARA_ENGINE_PATH` 环境变量覆盖。无需修改源码。
+3. 双击 `启动稳定下载.cmd`。启动脚本会拒绝低于 Node 22.13.0 的运行时。
 4. 打开 `http://127.0.0.1:18777/`，播放列表地址为 `http://127.0.0.1:18777/playlist`。
 5. 在 Tampermonkey 中安装 `IwaraResilientQueue.user.js`，并将下载方式指向本地队列。
+
+## 测试
+
+`npm test` 会运行状态机、失败分类、媒体格式和文件移动测试；`npm run test:engine` 会实际创建 SQLite 数据库并验证每日 backup 流程。
 
 ## 数据与隐私
 
 下载数据库、日志和运行时状态应放在本机数据目录，不要提交到 Git。视频文件也不会随源码发布。公开发布前请检查自己的目录、代理、令牌和浏览器配置。
+
+支持导入并校验 `.mp4`、`.webm`、`.mkv`、`.mov`、`.avi` 和 `.m4v`；本地媒体接口会根据实际扩展名返回对应 MIME 类型。
 
 ## 许可
 

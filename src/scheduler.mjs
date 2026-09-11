@@ -87,6 +87,10 @@ export function classifyError(message) {
   return "unknown";
 }
 
+export function isPermanentErrorCategory(category) {
+  return category === "not_found" || category === "access_or_expired";
+}
+
 function aria2FailureMessage(status) {
   const detail = String(status?.errorMessage || "").trim();
   const code = String(status?.errorCode || "").trim();
@@ -103,7 +107,7 @@ async function fileInfo(filePath) {
   }
 }
 
-async function mediaFileValidation(filePath, expectedLength, minimumBytes) {
+export async function mediaFileValidation(filePath, expectedLength, minimumBytes) {
   const info = await fileInfo(filePath);
   if (!info) return { ok: false, status: "missing", message: "下载文件不存在" };
   const minimum = Math.max(1024, Number(minimumBytes) || 65536);
@@ -118,10 +122,11 @@ async function mediaFileValidation(filePath, expectedLength, minimumBytes) {
   try {
     const head = Buffer.alloc(32);
     const { bytesRead } = await handle.read(head, 0, head.length, 0);
-    const isMp4 = bytesRead >= 8 && head.subarray(4, 8).toString("ascii") === "ftyp";
-    const isWebm = bytesRead >= 4 && head.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]));
-    if (!isMp4 && !isWebm) {
-      return { ok: false, status: "not_media", message: "下载结果不是有效 MP4/WebM 媒体文件，疑似 CDN 错误页" };
+    const isFtyp = bytesRead >= 8 && head.subarray(4, 8).toString("ascii") === "ftyp";
+    const isWebmOrMkv = bytesRead >= 4 && head.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]));
+    const isAvi = bytesRead >= 12 && head.subarray(0, 4).toString("ascii") === "RIFF" && head.subarray(8, 12).toString("ascii") === "AVI ";
+    if (!isFtyp && !isWebmOrMkv && !isAvi) {
+      return { ok: false, status: "not_media", message: "下载结果不是有效 MP4/WebM/MKV/MOV/AVI/M4V 媒体文件，疑似 CDN 错误页" };
     }
   } finally {
     await handle.close();
@@ -451,7 +456,7 @@ export class Scheduler {
       });
       // 页面明确返回 403/私人视频或不存在时，继续重试没有意义；
       // 终止并保留台账，让用户可以清楚区分权限/页面问题与临时 CDN 故障。
-      if (category === "access_or_expired" || category === "page_not_found") {
+      if (isPermanentErrorCategory(category)) {
         task.state = "failed";
         task.browserFallbackPending = false;
         task.browserFallbackAttempted = true;
@@ -700,7 +705,7 @@ export class Scheduler {
     return { queued: selected.length, remaining: Math.max(0, candidates.length - selected.length) };
   }
 
-  async retryOrFail(task, message, countedAttempt, { fallbackFailure = false, forceFallback = false } = {}) {
+  async retryOrFail(task, message, countedAttempt, { fallbackFailure = false, forceFallback = false, permanent = false } = {}) {
     if (!countedAttempt) task.attempts += 1;
     const wasFallback = task.resolved?.resolveMode === "browser_sniff" || fallbackFailure;
     task.gid = null;
@@ -710,7 +715,12 @@ export class Scheduler {
     task.updatedAt = nowIso();
     const ordinaryAttemptsExhausted = task.attempts >= this.config.maxAttempts;
     const canUseFallback = this.config.browserFallbackEnabled !== false && !task.browserFallbackAttempted;
-    if (!wasFallback && (ordinaryAttemptsExhausted || forceFallback) && canUseFallback) {
+    if (permanent) {
+      task.state = "failed";
+      task.browserFallbackPending = false;
+      task.browserFallbackAttempted = true;
+      task.message = `${message}；已确认无法下载，停止重试`;
+    } else if (!wasFallback && (ordinaryAttemptsExhausted || forceFallback) && canUseFallback) {
       task.state = "queued";
       task.browserFallbackPending = true;
       task.nextRunAt = this.clock.now() + this.config.retryDelayMs;
@@ -827,7 +837,7 @@ export class Scheduler {
       sourceHost: task.sourceHost || "",
       completedLength: task.completedLength || 0
     });
-    await this.retryOrFail(task, message, true);
+    await this.retryOrFail(task, message, true, { permanent: isPermanentErrorCategory(category) });
   }
 
   async complete(task) {

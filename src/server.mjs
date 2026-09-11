@@ -3,6 +3,8 @@ import { createReadStream } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 
+const SERVICE_VERSION = "1.10.1";
+
 function allowedOrigin(origin) {
   if (!origin) return true;
   try {
@@ -196,13 +198,26 @@ stripIdmPanels();new MutationObserver(mutations=>mutations.forEach(m=>m.addedNod
 </script></html>`;
 }
 
+const MEDIA_MIME_TYPES = new Map([
+  [".mp4", "video/mp4"],
+  [".webm", "video/webm"],
+  [".mkv", "video/x-matroska"],
+  [".mov", "video/quicktime"],
+  [".avi", "video/x-msvideo"],
+  [".m4v", "video/x-m4v"]
+]);
+
+export function mediaContentType(filePath) {
+  return MEDIA_MIME_TYPES.get(path.extname(String(filePath || "")).toLowerCase()) || "application/octet-stream";
+}
+
 async function serveLocalMedia(request, response, scheduler, encodedId) {
   try {
     const media = await scheduler.mediaPath(decodeURIComponent(encodedId));
     const info = await stat(media.path);
     const total = info.size;
     const baseHeaders = {
-      "content-type": "video/mp4",
+      "content-type": mediaContentType(media.path),
       "accept-ranges": "bytes",
       "cache-control": "private, max-age=3600",
       "content-disposition": `inline; filename*=UTF-8''${encodeURIComponent(media.name)}`
@@ -315,7 +330,7 @@ export function createServer({ scheduler, host, port, onShutdown }) {
         });
         response.end(body);
       } else if (request.method === "GET" && url.pathname === "/health") {
-        reply(200, { ok: true, service: "iwara-resilient-queue", version: "1.10.0" });
+        reply(200, { ok: true, service: "iwara-resilient-queue", version: SERVICE_VERSION });
       } else if (request.method === "GET" && url.pathname === "/api/status") {
         reply(200, scheduler.status());
       } else if (request.method === "GET" && url.pathname === "/api/ledger") {
