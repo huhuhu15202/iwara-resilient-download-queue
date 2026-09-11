@@ -183,6 +183,8 @@ export class Scheduler {
     this.config = config;
     this.clock = clock;
     this.timer = null;
+    this.reconcileTimer = null;
+    this.reconcileCursor = 0;
     this.busy = false;
   }
 
@@ -337,11 +339,32 @@ export class Scheduler {
     if (this.timer) return;
     this.timer = setInterval(() => this.tick().catch(console.error), this.config.pollMs);
     this.timer.unref?.();
+    const interval = Math.max(60_000, Number(this.config.mediaReconcileIntervalMs || 300_000));
+    this.reconcileTimer = setInterval(() => this.reconcileMediaBatch().catch(console.error), interval);
+    this.reconcileTimer.unref?.();
   }
 
   stop() {
     clearInterval(this.timer);
     this.timer = null;
+    clearInterval(this.reconcileTimer);
+    this.reconcileTimer = null;
+  }
+
+  async reconcileMediaBatch() {
+    const completed = this.store.state.tasks.filter(task => task.state === "completed" && task.destination);
+    if (!completed.length) return { checked: 0, changed: 0 };
+    const batchSize = Math.max(1, Number(this.config.mediaReconcileBatchSize || 50));
+    let changed = 0;
+    for (let index = 0; index < Math.min(batchSize, completed.length); index += 1) {
+      const task = completed[(this.reconcileCursor + index) % completed.length];
+      const before = `${task.fileStatus}|${task.actualFileSize}|${task.destination}`;
+      await this.verifyCompletedTask(task);
+      if (before !== `${task.fileStatus}|${task.actualFileSize}|${task.destination}`) changed += 1;
+    }
+    this.reconcileCursor = (this.reconcileCursor + Math.min(batchSize, completed.length)) % completed.length;
+    if (changed) await this.store.save();
+    return { checked: Math.min(batchSize, completed.length), changed };
   }
 
   maxConcurrentTasks() {
@@ -864,6 +887,9 @@ export class Scheduler {
     await this.cleanupTaskStaging(task);
     task.state = "completed";
     task.destination = destination;
+    const finalInfo = await fileInfo(destination);
+    task.actualFileSize = finalInfo ? String(finalInfo.size) : "0";
+    task.mediaCheckedAt = nowIso();
     task.pendingDestination = null;
     task.fileStatus = "present";
     task.gid = null;
@@ -887,6 +913,9 @@ export class Scheduler {
     if (destination && await fileInfo(destination)) {
       if (task.gid) await this.aria2.forget(task.gid);
       task.destination = destination;
+      const recoveredInfo = await fileInfo(destination);
+      task.actualFileSize = recoveredInfo ? String(recoveredInfo.size) : "0";
+      task.mediaCheckedAt = nowIso();
       task.pendingDestination = null;
       task.state = "completed";
       task.fileStatus = "present";
@@ -911,13 +940,16 @@ export class Scheduler {
   }
 
   async verifyCompletedTask(task) {
+    task.mediaCheckedAt = nowIso();
     if (!task.destination) {
       task.fileStatus = "unknown";
+      task.actualFileSize = "0";
       return;
     }
     const media = await this.locateMediaFile(task);
     if (!media) {
       task.fileStatus = "missing";
+      task.actualFileSize = "0";
       return;
     }
     if (path.resolve(task.destination) !== path.resolve(media.path)) {
@@ -1203,7 +1235,34 @@ export class Scheduler {
     return { ...result, tasks: result.tasks.map(publicTask), authors: this.store.authors?.() || [] };
   }
 
-  async playlist({ query = "", author = "all", taskId = "", contextId = "", contextSize = 5, sort = "updatedAt", direction = "desc", page = 1, pageSize = 25, randomPage = false } = {}) {
+  async playlist({ query = "", author = "all", watched = "all", taskId = "", contextId = "", contextSize = 5, sort = "updatedAt", direction = "desc", page = 1, pageSize = 25, randomPage = false } = {}) {
+    if (this.store.queryPlaylist) {
+      const result = this.store.queryPlaylist({
+        query, author, watched, sort, direction, page, pageSize, randomPage, contextId, contextSize
+      });
+      let playerError = null;
+      if (contextId && !result.currentIndex && result.currentIndex !== 0) {
+        const contextTask = this.store.state.tasks.find(task => task.id === contextId);
+        if (!contextTask) playerError = { code: "record_not_found", message: "台账中找不到这个视频记录。" };
+        else if (contextTask.state !== "completed") playerError = { code: "not_completed", message: `该记录当前状态为“${contextTask.state}”，尚未成为可播放文件。` };
+        else if (contextTask.fileStatus !== "present") playerError = {
+          code: "missing_file",
+          message: `台账记录存在，但本地文件状态为“${contextTask.fileStatus || "未检查"}”；请先检查文件或重新下载。`
+        };
+        else playerError = {
+          code: "media_unavailable",
+          message: "台账标记为正常，但当前文件无法访问；请刷新台账或检查文件位置。"
+        };
+      }
+      const items = result.tasks.map(task => ({
+        ...publicTask(task),
+        streamUrl: `/media/${encodeURIComponent(task.id)}`,
+        views: task.viewCount ?? task.views ?? null,
+        viewsUpdatedAt: task.viewsUpdatedAt || null,
+        localFileName: path.basename(task.destination)
+      }));
+      return { total: result.total, page: result.page, pageSize: result.pageSize, currentIndex: result.currentIndex, items, playerError };
+    }
     const needle = String(query || "").trim().toLocaleLowerCase();
     const matches = [];
     for (const task of this.store.state.tasks) {
@@ -1270,6 +1329,27 @@ export class Scheduler {
         localFileName: path.basename(task.destination)
       }));
     return { total: matches.length, page: safePage, pageSize: safePageSize, currentIndex, items };
+  }
+
+  async updatePlayback(taskId, payload = {}) {
+    const { position = 0, duration = 0 } = payload;
+    const explicitWatched = typeof payload.watched === "boolean" ? payload.watched : null;
+    const task = this.store.state.tasks.find(item => item.id === taskId);
+    if (!task || task.state !== "completed") throw new Error("只能保存已完成视频的播放状态");
+    const numericDuration = Number(duration);
+    const safeDuration = Number.isFinite(numericDuration) && numericDuration > 0 ? numericDuration : Number(task.playbackDuration || 0) || 0;
+    const numericPosition = Number(position);
+    let safePosition = Number.isFinite(numericPosition) && numericPosition >= 0 ? numericPosition : 0;
+    if (safeDuration > 0) safePosition = Math.min(safeDuration, safePosition);
+    const isWatched = explicitWatched === null
+      ? (safeDuration > 0 && safePosition / safeDuration >= 0.95)
+      : explicitWatched;
+    task.playbackPosition = isWatched && safeDuration > 0 ? safeDuration : safePosition;
+    task.playbackDuration = safeDuration;
+    task.watched = isWatched;
+    task.playbackUpdatedAt = nowIso();
+    await this.store.save();
+    return publicTask(task);
   }
 
   mediaCandidates(task) {

@@ -10,6 +10,7 @@ import {
   mediaFileValidation,
   moveFileSafely
 } from "../src/scheduler.mjs";
+import { SQLiteStore } from "../src/sqlite-store.mjs";
 import { mediaContentType } from "../src/server.mjs";
 
 async function tempRoot(prefix = "iwara-test-") {
@@ -366,6 +367,50 @@ describe("scheduler state transitions", () => {
       assert.equal(result.currentIndex, 2);
       assert.ok(result.items.some(item => item.id === "task-3"));
     } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  test("SQLite playlist uses cached media state and persists playback", async () => {
+    const root = await tempRoot();
+    let sqlite;
+    try {
+      const media = path.join(root, "cached.mp4");
+      await writeFile(media, Buffer.concat([Buffer.from([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70]), Buffer.alloc(2048)]));
+      sqlite = new SQLiteStore({
+        filePath: path.join(root, "ledger.sqlite"),
+        legacyJsonPath: path.join(root, "state.json"),
+        backupRoot: path.join(root, "backups")
+      });
+      await sqlite.load();
+      const currentTask = task({ id: "cached-task", videoId: "cached-video", state: "completed", destination: media, fileStatus: "present", mediaCheckedAt: new Date().toISOString() });
+      sqlite.state.tasks = [currentTask];
+      await sqlite.save();
+      const current = new Scheduler({
+        store: sqlite,
+        aria2: aria2(),
+        config: { downloadRoot: root, maxConcurrentTasks: 3 }
+      });
+      const result = await current.playlist({ page: 1, pageSize: 30 });
+      assert.equal(result.total, 1);
+      assert.equal(result.items[0].id, "cached-task");
+      await current.updatePlayback("cached-task", { position: 37.5, duration: 120, watched: false });
+      assert.equal(currentTask.playbackPosition, 37.5);
+      assert.equal(currentTask.watched, false);
+      sqlite.close();
+      sqlite = null;
+      const reopened = new SQLiteStore({
+        filePath: path.join(root, "ledger.sqlite"),
+        legacyJsonPath: path.join(root, "state.json"),
+        backupRoot: path.join(root, "backups")
+      });
+      await reopened.load();
+      assert.equal(reopened.state.tasks[0].playbackPosition, 37.5);
+      assert.equal(reopened.state.tasks[0].playbackDuration, 120);
+      assert.equal(reopened.state.tasks[0].watched, false);
+      reopened.close();
+    } finally {
+      sqlite?.close();
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   test("moveFileSafely handles a normal rename", async () => {

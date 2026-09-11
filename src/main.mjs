@@ -38,6 +38,8 @@ async function loadConfig() {
     aria2Secret: randomBytes(18).toString("hex"),
     maxAttempts: 6,
     maxConcurrentTasks: 3,
+    mediaReconcileIntervalMs: 300000,
+    mediaReconcileBatchSize: 50,
     retryDelayMs: 3000,
     leaseMs: 120000,
     stallMs: 180000,

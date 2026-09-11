@@ -7,6 +7,8 @@
   "aria2Port": 16801,
   "maxAttempts": 6,
   "maxConcurrentTasks": 3,
+  "mediaReconcileIntervalMs": 300000,
+  "mediaReconcileBatchSize": 50,
   "browserFallbackEnabled": true,
   "browserFallbackTimeoutMs": 45000,
   "minValidMediaBytes": 65536

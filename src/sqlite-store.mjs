@@ -113,6 +113,24 @@ export class SQLiteStore {
       );
     `);
 
+    // Keep frequently queried media/player state in indexed columns while
+    // retaining data_json as the forward-compatible task record.
+    const columns = new Set(this.db.prepare("PRAGMA table_info(tasks)").all().map(row => row.name));
+    const additions = [
+      ["media_status", "TEXT NOT NULL DEFAULT 'unknown'"],
+      ["media_size", "INTEGER"],
+      ["media_checked_at", "TEXT"],
+      ["playback_position", "REAL NOT NULL DEFAULT 0"],
+      ["playback_duration", "REAL NOT NULL DEFAULT 0"],
+      ["watched", "INTEGER NOT NULL DEFAULT 0"],
+      ["playback_updated_at", "TEXT"]
+    ];
+    for (const [name, definition] of additions) {
+      if (!columns.has(name)) this.db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${definition}`);
+    }
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_state_media ON tasks(state, media_status, watched, updated_at DESC)");
+    this.backfillIndexedFields();
+
     const count = Number(this.db.prepare("SELECT COUNT(*) AS count FROM tasks").get().count);
     if (count === 0) await this.migrateLegacyJson();
     this.reloadMemory();
@@ -125,6 +143,38 @@ export class SQLiteStore {
     this.state.tasks = rows.map(row => JSON.parse(row.data_json));
     this.snapshots.clear();
     for (const task of this.state.tasks) this.snapshots.set(task.id, JSON.stringify(task));
+  }
+
+  backfillIndexedFields() {
+    const update = this.db.prepare(`
+      UPDATE tasks SET media_status=?, media_size=?, media_checked_at=?,
+        playback_position=?, playback_duration=?, watched=?, playback_updated_at=?
+      WHERE id=?
+    `);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const rows = this.db.prepare(`
+        SELECT id, data_json FROM tasks
+        WHERE media_status='unknown' OR media_checked_at IS NULL
+      `).all();
+      for (const row of rows) {
+        const task = JSON.parse(row.data_json);
+        update.run(
+          task.fileStatus || "unknown",
+          Number(task.actualFileSize || 0) || null,
+          task.mediaCheckedAt || null,
+          Number(task.playbackPosition || 0) || 0,
+          Number(task.playbackDuration || 0) || 0,
+          task.watched ? 1 : 0,
+          task.playbackUpdatedAt || null,
+          row.id
+        );
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   async migrateLegacyJson() {
@@ -154,13 +204,21 @@ export class SQLiteStore {
     this.db.prepare(`
       INSERT INTO tasks (
         id, video_id, state, title, author, alias, upload_time,
-        attempts, created_at, updated_at, data_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        attempts, created_at, updated_at, data_json,
+        media_status, media_size, media_checked_at,
+        playback_position, playback_duration, watched, playback_updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         video_id=excluded.video_id, state=excluded.state, title=excluded.title,
         author=excluded.author, alias=excluded.alias, upload_time=excluded.upload_time,
         attempts=excluded.attempts, created_at=excluded.created_at,
-        updated_at=excluded.updated_at, data_json=excluded.data_json
+        updated_at=excluded.updated_at, data_json=excluded.data_json,
+        media_status=excluded.media_status, media_size=excluded.media_size,
+        media_checked_at=excluded.media_checked_at,
+        playback_position=excluded.playback_position,
+        playback_duration=excluded.playback_duration,
+        watched=excluded.watched,
+        playback_updated_at=excluded.playback_updated_at
     `).run(
       task.id,
       task.videoId,
@@ -172,7 +230,14 @@ export class SQLiteStore {
       Number(task.attempts || 0),
       task.createdAt || new Date().toISOString(),
       task.updatedAt || new Date().toISOString(),
-      data
+      data,
+      task.fileStatus || "unknown",
+      Number(task.actualFileSize || 0) || null,
+      task.mediaCheckedAt || null,
+      Number(task.playbackPosition || 0) || 0,
+      Number(task.playbackDuration || 0) || 0,
+      task.watched ? 1 : 0,
+      task.playbackUpdatedAt || null
     );
     return data;
   }
@@ -236,7 +301,7 @@ export class SQLiteStore {
 
   queryTasks({
     query = "", state = "all", author = "all", sort = "updatedAt",
-    direction = "desc", page = 1, pageSize = 50
+    direction = "desc", page = 1, pageSize = 50, watched = "all"
   } = {}) {
     const where = [];
     const params = [];
@@ -252,6 +317,10 @@ export class SQLiteStore {
     if (author !== "all") {
       where.push("author=?");
       params.push(author);
+    }
+    if (watched === "watched" || watched === "unwatched") {
+      where.push("watched=?");
+      params.push(watched === "watched" ? 1 : 0);
     }
     const clause = where.length ? `WHERE ${where.join(" AND ")}` : "";
     const total = Number(this.db.prepare(`SELECT COUNT(*) AS count FROM tasks ${clause}`).get(...params).count);
@@ -269,6 +338,61 @@ export class SQLiteStore {
       pageSize: safePageSize,
       tasks: rows.map(row => JSON.parse(row.data_json))
     };
+  }
+
+  queryPlaylist({
+    query = "", author = "all", watched = "all", sort = "updatedAt",
+    direction = "desc", page = 1, pageSize = 30, randomPage = false,
+    contextId = "", contextSize = 5
+  } = {}) {
+    const where = ["state='completed'", "media_status='present'", "COALESCE(json_extract(data_json, '$.destination'), '')<>''"];
+    const params = [];
+    if (query) {
+      where.push("(title LIKE ? ESCAPE '\\' OR author LIKE ? ESCAPE '\\' OR alias LIKE ? ESCAPE '\\' OR video_id LIKE ? ESCAPE '\\')");
+      const escaped = `%${String(query).replace(/[\\%_]/g, "\\$&")}%`;
+      params.push(escaped, escaped, escaped, escaped);
+    }
+    if (author !== "all") { where.push("author=?"); params.push(author); }
+    if (watched === "watched" || watched === "unwatched") {
+      where.push("watched=?"); params.push(watched === "watched" ? 1 : 0);
+    }
+    const clause = `WHERE ${where.join(" AND ")}`;
+    const total = Number(this.db.prepare(`SELECT COUNT(*) AS count FROM tasks ${clause}`).get(...params).count);
+    const orderColumns = {
+      title: "LOWER(title)",
+      author: "LOWER(CASE WHEN alias<>'' THEN alias ELSE author END)",
+      uploadTime: "COALESCE(upload_time, 0)",
+      views: "COALESCE(CAST(json_extract(data_json, '$.viewCount') AS INTEGER), CAST(json_extract(data_json, '$.views') AS INTEGER), -1)",
+      updatedAt: "updated_at"
+    };
+    const orderColumn = orderColumns[sort] || orderColumns.updatedAt;
+    const order = direction === "asc" ? "ASC" : "DESC";
+    const tieOrder = "ASC";
+    const safePageSize = Math.min(60, Math.max(6, Number(pageSize) || 30));
+    let safePage = Math.max(1, Number(page) || 1);
+    let currentIndex = null;
+    let offset = (safePage - 1) * safePageSize;
+    if (contextId) {
+      const center = this.db.prepare(`SELECT ${orderColumn} AS order_value, id FROM tasks ${clause} AND id=?`).get(...params, contextId);
+      if (center) {
+        const comparator = order === "ASC"
+          ? `(${orderColumn} < ? OR (${orderColumn} = ? AND id < ?))`
+          : `(${orderColumn} > ? OR (${orderColumn} = ? AND id < ?))`;
+        const before = Number(this.db.prepare(`SELECT COUNT(*) AS count FROM tasks ${clause} AND ${comparator}`).get(...params, center.order_value, center.order_value, center.id).count);
+        const size = Math.min(9, Math.max(2, Number(contextSize) || 5));
+        offset = Math.max(0, Math.min(before - Math.floor(size / 2), Math.max(0, total - size)));
+        currentIndex = before - offset;
+        safePage = 1;
+        const rows = this.db.prepare(`SELECT data_json FROM tasks ${clause} ORDER BY ${orderColumn} ${order}, id ${tieOrder} LIMIT ? OFFSET ?`).all(...params, size, offset);
+        return { total, page: safePage, pageSize: size, currentIndex, tasks: rows.map(row => JSON.parse(row.data_json)) };
+      }
+      return { total, page: 1, pageSize: Math.min(9, Math.max(2, Number(contextSize) || 5)), currentIndex: null, tasks: [] };
+    }
+    const pageCount = Math.max(1, Math.ceil(total / safePageSize));
+    safePage = randomPage ? 1 + Math.floor(Math.random() * pageCount) : Math.min(pageCount, safePage);
+    offset = (safePage - 1) * safePageSize;
+    const rows = this.db.prepare(`SELECT data_json FROM tasks ${clause} ORDER BY ${orderColumn} ${order}, id ${tieOrder} LIMIT ? OFFSET ?`).all(...params, safePageSize, offset);
+    return { total, page: safePage, pageSize: safePageSize, currentIndex, tasks: rows.map(row => JSON.parse(row.data_json)) };
   }
 
   counts() {
