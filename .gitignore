@@ -1,0 +1,9 @@
+node_modules/
+ServiceData/
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.part
+*.tmp
+*.zip

@@ -1,0 +1,385 @@
+import http from "node:http";
+import { createReadStream } from "node:fs";
+import { readFile, stat } from "node:fs/promises";
+import path from "node:path";
+
+function allowedOrigin(origin) {
+  if (!origin) return true;
+  try {
+    const parsed = new URL(origin);
+    if (parsed.protocol === "chrome-extension:" && parsed.hostname === "dhdgffkkebhmkfjojejmpbldmpobfkfo") return true;
+    if (["127.0.0.1", "localhost"].includes(parsed.hostname)) return true;
+    return parsed.protocol === "https:" && (parsed.hostname === "iwara.tv" || parsed.hostname.endsWith(".iwara.tv"));
+  } catch {
+    return false;
+  }
+}
+
+function sendJson(response, status, payload, origin = "") {
+  const body = JSON.stringify(payload);
+  const headers = {
+    "content-type": "application/json; charset=utf-8",
+    "content-length": Buffer.byteLength(body),
+    // The ledger API is an internal data endpoint.  Keep it uncached and
+    // explicitly inline so Chrome does not try to treat it as a download.
+    "cache-control": "no-store",
+    "content-disposition": "inline",
+    "x-content-type-options": "nosniff"
+  };
+  if (origin && allowedOrigin(origin)) {
+    headers["access-control-allow-origin"] = origin;
+    headers["vary"] = "Origin";
+  }
+  response.writeHead(status, headers);
+  response.end(body);
+}
+
+async function readJson(request) {
+  const chunks = [];
+  for await (const chunk of request) chunks.push(chunk);
+  if (!chunks.length) return {};
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
+
+function dashboardHtml() {
+  return `<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width">
+<title>Iwara 稳定下载队列</title>
+<style>
+*{box-sizing:border-box}body{font:14px/1.5 "Segoe UI","Microsoft YaHei",system-ui;margin:0;background:#f3f6fb;color:#253247}main{max-width:1540px;margin:auto;padding:28px}
+h1{font-size:27px;letter-spacing:.2px;margin:0 0 8px;color:#17365f}.hint{color:#63738a;margin:0 0 20px}.hint a{text-decoration:none}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(125px,1fr));gap:12px;margin-bottom:16px}
+.card{background:#fff;padding:14px 16px;border:1px solid #dce5f0;border-radius:14px;cursor:pointer;color:#52627a;box-shadow:0 4px 14px rgba(45,76,120,.06);text-align:left}
+.card:hover,.card.active{border-color:#5b8def;background:#eef5ff;box-shadow:0 6px 18px rgba(49,101,185,.12)}.card b{display:block;font-size:22px;color:#1e5fae;margin-bottom:2px}
+.current{background:#fff;border:1px solid #d9e5f2;border-left:5px solid #5b8def;padding:13px 16px;border-radius:12px;margin:10px 0;box-shadow:0 3px 12px rgba(45,76,120,.05)}
+.filters{display:grid;grid-template-columns:minmax(260px,2fr) repeat(4,minmax(145px,1fr));gap:10px;margin:18px 0 14px;background:#fff;padding:14px;border:1px solid #dfe7f1;border-radius:14px}
+input,select,button{font:inherit;border:1px solid #cbd7e6;border-radius:9px;padding:9px 11px;background:#fff;color:#33445c;min-height:38px}
+input:focus,select:focus{outline:3px solid #dceaff;border-color:#5b8def}button{cursor:pointer;font-weight:600}button:hover{border-color:#5b8def;background:#eef5ff}button:disabled{opacity:.45;cursor:not-allowed}
+.table-wrap{overflow:auto;border:1px solid #dce5ef;border-radius:14px;background:#fff;box-shadow:0 5px 18px rgba(45,76,120,.06)}
+table{width:100%;border-collapse:separate;border-spacing:0;background:#fff;min-width:1420px;table-layout:fixed}th,td{padding:11px 12px;border-bottom:1px solid #e8eef5;text-align:left;vertical-align:top;overflow-wrap:anywhere}
+th{position:sticky;top:0;z-index:1;background:#edf4fc;color:#36516f;white-space:nowrap;font-weight:700}tbody tr:hover{background:#f7faff}
+th:nth-child(1){width:82px}th:nth-child(2){width:310px}th:nth-child(3){width:180px}th:nth-child(4),th:nth-child(5){width:155px}th:nth-child(6){width:105px}th:nth-child(7){width:62px}th:nth-child(8){width:245px}th:nth-child(9){width:185px}
+.title b{display:block;color:#203957;font-size:14px}.muted{color:#7a899d;font-size:12px;margin-top:3px}
+td.completed{color:#25835a;font-weight:700}td.failed{color:#c74444;font-weight:700}td.downloading{color:#246ec2;font-weight:700}td.queued,td.resolving,td.finalizing{color:#a66b06;font-weight:700}
+.present{color:#25835a}.missing,.size_mismatch{color:#c74444}.progress{height:8px;background:#e7eef7;border-radius:8px;overflow:hidden;margin-top:8px}.progress i{display:block;height:100%;background:linear-gradient(90deg,#5b8def,#6bb7ee)}
+.actions{display:flex;gap:6px;flex-wrap:wrap}.actions a{text-decoration:none}.actions button{padding:6px 9px;min-height:32px;font-size:12px}
+.pager{display:flex;justify-content:space-between;gap:14px;align-items:center;margin-top:14px;background:#fff;border:1px solid #dfe7f1;border-radius:12px;padding:12px 14px}.pager>span:last-child{display:flex;gap:7px;flex-wrap:wrap}.empty{text-align:center;color:#7a899d;padding:34px}
+.modal-backdrop{position:fixed;inset:0;z-index:20;background:rgba(35,50,71,.35);display:none;align-items:center;justify-content:center;padding:18px}.modal-backdrop.open{display:flex}.modal{width:min(980px,100%);max-height:90vh;overflow:auto;background:#f8fbff;border-radius:18px;padding:20px;box-shadow:0 24px 70px rgba(29,52,84,.3)}.modal h2{margin:0 0 5px;color:#17365f}.modal-tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:14px 0}.modal-tools input{min-width:240px;flex:1}.author-grid{display:grid;gap:8px}.author-row{display:grid;grid-template-columns:32px minmax(190px,1fr) 110px 125px minmax(210px,1.2fr);gap:9px;align-items:center;background:#fff;border:1px solid #dfe7f1;border-radius:11px;padding:9px 11px}.author-row input[type=checkbox]{min-height:auto;width:18px;height:18px}.author-row input[type=text]{width:100%}.modal-actions{position:sticky;bottom:-20px;display:flex;justify-content:flex-end;gap:8px;background:#f8fbff;padding:14px 0 0}.preview{white-space:pre-wrap;background:#eef5ff;border-radius:10px;padding:11px 13px;color:#36516f;margin-top:12px}
+@media(max-width:900px){main{padding:14px}.filters{grid-template-columns:1fr 1fr}.filters input{grid-column:1/-1}.pager{align-items:flex-start;flex-direction:column}h1{font-size:23px}}
+@media(max-width:700px){.author-row{grid-template-columns:28px 1fr}.author-row>*:nth-child(n+3){grid-column:2}.filters{grid-template-columns:1fr}.cards{grid-template-columns:1fr 1fr}}
+</style><main><h1>Iwara 稳定下载台账</h1><p class="hint">成功与失败记录都会永久保留；同一视频 ID 不会重复下载。 <button onclick="openDownloadDirectory()">打开视频目录</button> <a href="/playlist" target="_blank"><button>打开本地播放列表</button></a> <a href="/IwaraResilientQueue.user.js"><button>安装 / 更新网页脚本</button></a></p>
+<div class="cards" id="cards"></div><div id="current"></div><div id="metadataProgress"></div>
+<div class="filters">
+  <input id="query" placeholder="搜索标题、作者或视频 ID">
+  <select id="stateFilter"><option value="all">全部状态</option></select>
+  <select id="authorFilter"><option value="all">全部作者</option></select>
+  <select id="sortBy">
+    <option value="updatedAt">按最近记录</option><option value="uploadTime">按上传日期</option>
+    <option value="title">按标题</option><option value="author">按作者</option>
+    <option value="state">按状态</option><option value="attempts">按尝试次数</option>
+  </select>
+  <select id="direction"><option value="desc">降序</option><option value="asc">升序</option></select>
+</div>
+<div class="table-wrap"><table><thead><tr><th>状态</th><th>标题 / 视频 ID</th><th>作者</th><th>上传日期</th><th>记录日期</th><th>文件</th><th>尝试</th><th>说明</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table></div>
+<div class="pager"><span id="summary"></span><span><button id="previous">上一页</button> <button id="next">下一页</button> <button onclick="openAuthorClassification()">按作者整理视频</button> <button onclick="queueViews()">同步缺失播放量</button> <button onclick="retryMetadata()">重试补齐失败项</button> <button onclick="verifyFiles()">检查文件</button> <button onclick="shutdown()">停止服务</button></span></div>
+<div id="authorModal" class="modal-backdrop" onclick="if(event.target===this)closeAuthorClassification()"><section class="modal">
+  <h2>按作者整理已下载视频</h2>
+  <div class="hint">只显示已完成视频超过 10 个的作者。勾选作者并填写分类目录；多个作者使用相同目录名，就会合并到同一个目录。先预览，确认后才移动当前根目录中的视频；以后新下载也自动归类。</div>
+  <div class="modal-tools"><button onclick="toggleAllAuthors(true)">全选</button><button onclick="toggleAllAuthors(false)">清空选择</button><input id="mergeFolder" placeholder="给勾选作者设置同一个分类目录"><button onclick="setMergedFolder()">合并到此目录</button></div>
+  <div id="authorRows" class="author-grid"></div>
+  <div id="classificationPreview" class="preview">尚未预览。</div>
+  <div class="modal-actions"><button onclick="closeAuthorClassification()">关闭</button><button onclick="previewAuthorClassification()">预览移动</button><button id="applyClassification" onclick="applyAuthorClassification()" disabled>确认整理</button></div>
+</section></div>
+<script>
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const stateNames={queued:'等待中',resolving:'解析中',downloading:'下载中',finalizing:'文件入库',completed:'已完成',failed:'已失败'};
+const fileNames={present:'正常',missing:'文件缺失',size_mismatch:'大小异常',unknown:'未检查'};
+const errorNames={tls_certificate:'CDN 证书或主机名不匹配',tls_handshake:'TLS 握手失败',source_exhausted:'可用 CDN 均已尝试',not_found:'视频源不存在',access_or_expired:'地址过期或拒绝访问',timeout:'下载超时',network:'网络连接失败',permission:'权限不足',source_unavailable:'没有可用视频源',unknown:'其他错误'};
+let summaryData={counts:{},metadataCounts:{},currents:[],metadataCurrents:[],current:null,total:0},ledger={tasks:[],authors:[],total:0,page:1,pageSize:50},page=1,loading=false,pendingLoad=false,inputTimer,authorCandidates=[],classificationPreview=null;const pageSize=50;
+const el=id=>document.getElementById(id);
+const dateText=value=>{if(!value)return '—';const d=new Date(value);return Number.isNaN(d.getTime())?'—':d.toLocaleString('zh-CN',{hour12:false})};
+const authorText=t=>t.alias?(t.alias+(t.author&&t.author!==t.alias?' (@'+t.author+')':'')):(t.author||'—');
+const bytes=value=>{const n=Number(value||0);if(!n)return '—';const units=['B','KiB','MiB','GiB'];let i=0,v=n;while(v>=1024&&i<units.length-1){v/=1024;i++}return v.toFixed(i?1:0)+' '+units[i]};
+const progressText=t=>{const done=Number(t.completedLength||0),total=Number(t.totalLength||0),speed=Number(t.downloadSpeed||0),pct=total?Math.min(100,done/total*100):0,eta=speed&&total>done?Math.ceil((total-done)/speed):0;return{pct,text:bytes(done)+' / '+bytes(total)+(speed?' · '+bytes(speed)+'/s':'')+(eta?' · 约 '+eta+' 秒':'')}};
+async function retry(id){await fetch('/api/retry/'+id,{method:'POST'});await load()}
+async function redownload(id){if(confirm('记录对应的文件缺失，确定重新下载？')){await fetch('/api/redownload/'+id,{method:'POST'});await load()}}
+async function verifyFiles(){const r=await(await fetch('/api/verify-files',{method:'POST'})).json();alert('检查完成：正常 '+r.present+'，缺失 '+r.missing+'，大小异常 '+r.sizeMismatch);await load()}
+async function openDownloadDirectory(){const r=await fetch('/api/open-download-directory',{method:'POST'});if(!r.ok){const body=await r.json();alert('打开目录失败：'+(body.error||r.status))}}
+async function retryMetadata(){const r=await(await fetch('/api/enrich/retry-failed',{method:'POST'})).json();alert('已将 '+r.count+' 条补齐失败记录放回队列');await load()}
+async function queueViews(){const r=await(await fetch('/api/enrich/queue-views',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})})).json();alert('已加入 '+r.queued+' 条播放量同步任务'+(r.remaining?'，尚有 '+r.remaining+' 条待加入':'')+'。保持任一 Iwara 视频页打开，网页脚本会以最多 3 个并发逐步处理。');await load()}
+async function history(id){const list=await(await fetch('/api/attempts/'+id)).json();alert(list.length?list.map(x=>dateText(x.createdAt)+' · 第'+x.attemptNo+'次 · '+x.phase+' · '+x.outcome+(x.sourceHost?' · '+x.sourceHost:'')+(x.message?'\\n'+x.message:'')).join('\\n\\n'):'尚无尝试明细')}
+async function shutdown(){if(confirm('停止稳定下载服务？当前任务下次启动时会重新解析。')){await fetch('/api/shutdown',{method:'POST'});document.body.innerHTML='<main><h1>服务已停止</h1><p>需要下载时重新双击启动文件即可。</p></main>'}}
+function selectedAuthorRules(){return [...document.querySelectorAll('.author-choice:checked')].map(box=>({author:box.dataset.author,folder:document.querySelector('.author-folder[data-author="'+CSS.escape(box.dataset.author)+'"]').value.trim()}))}
+function invalidateClassificationPreview(){classificationPreview=null;el('applyClassification').disabled=true;el('classificationPreview').textContent='选择已更改，请重新预览。'}
+async function openAuthorClassification(){const r=await fetch('/api/author-categories?minCount=10');const data=await r.json();if(!r.ok){alert(data.error||r.status);return}authorCandidates=data.candidates||[];el('authorRows').innerHTML=authorCandidates.length?authorCandidates.map(a=>'<label class="author-row"><input class="author-choice" type="checkbox" data-author="'+esc(a.author)+'" '+(a.category?'checked':'')+' onchange="invalidateClassificationPreview()"><span><b>'+esc(a.alias||a.author)+'</b><div class="muted">@'+esc(a.author)+'</div></span><span>已完成 '+a.completedCount+'</span><span>未分类 '+a.unclassifiedCount+'</span><input class="author-folder" type="text" data-author="'+esc(a.author)+'" value="'+esc(a.category||a.alias||a.author)+'" oninput="invalidateClassificationPreview()" aria-label="分类目录"></label>').join(''):'<div class="empty">目前没有超过 10 个已完成视频的作者</div>';el('classificationPreview').textContent='尚未预览。';el('applyClassification').disabled=true;el('authorModal').classList.add('open')}
+function closeAuthorClassification(){el('authorModal').classList.remove('open')}
+function toggleAllAuthors(checked){document.querySelectorAll('.author-choice').forEach(box=>box.checked=checked);invalidateClassificationPreview()}
+function setMergedFolder(){const folder=el('mergeFolder').value.trim();if(!folder){alert('请先填写合并后的分类目录名');return}document.querySelectorAll('.author-choice:checked').forEach(box=>{document.querySelector('.author-folder[data-author="'+CSS.escape(box.dataset.author)+'"]').value=folder});invalidateClassificationPreview()}
+async function previewAuthorClassification(){const rules=selectedAuthorRules();const r=await fetch('/api/author-categories/preview',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({minCount:10,rules})});const data=await r.json();if(!r.ok){alert(data.error||r.status);return}classificationPreview=data;el('classificationPreview').textContent='将保存 '+data.rules.length+' 条作者规则，移动 '+data.moveCount+' 个根目录视频。\\n已在分类目录：'+data.alreadyClassifiedCount+'；文件缺失：'+data.missingCount+'；目标重名：'+data.collisionCount+'。'+(data.collisionCount?'\\n重名文件会自动保留并追加序号，不会覆盖。':'');el('applyClassification').disabled=false}
+async function applyAuthorClassification(){if(!classificationPreview)return;if(!confirm('确认按预览结果整理视频？文件会移动到 Video 下的分类目录，但不会删除。'))return;el('applyClassification').disabled=true;const r=await fetch('/api/author-categories/apply',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({minCount:10,rules:selectedAuthorRules()})});const data=await r.json();if(!r.ok){alert(data.error||r.status);return}alert('整理完成：移动 '+data.moved+' 个，跳过 '+data.skipped+' 个，缺失 '+data.missing+' 个，失败 '+data.errors.length+' 个。');closeAuthorClassification();await load()}
+function setState(value){el('stateFilter').value=value;page=1;load()}
+function render(){
+  el('cards').innerHTML='<button class="card '+(el('stateFilter').value==='all'?'active':'')+'" onclick="setState(\\'all\\')"><b>'+summaryData.total+'</b>全部记录</button>'+
+    Object.entries(summaryData.counts).map(([k,v])=>'<button class="card '+(el('stateFilter').value===k?'active':'')+'" onclick="setState(\\''+k+'\\')"><b>'+v+'</b>'+esc(stateNames[k]||k)+'</button>').join('');
+  const currents=summaryData.currents||[];
+  el('current').innerHTML=currents.map((t,index)=>{const p=progressText(t);return '<div class="current">活动任务 '+(index+1)+' / '+summaryData.maxConcurrentTasks+'：<b>'+esc(t.title||t.videoId)+'</b> · '+esc(t.message)+'<div class="muted">'+esc(p.text)+'</div><div class="progress"><i style="width:'+p.pct+'%"></i></div></div>'}).join('');
+  const m=summaryData.metadataCounts||{},v=summaryData.viewCounts||{},remaining=Number(m.pending||0)+Number(m.retry||0)+Number(m.enriching||0);
+  const metadataNow=(summaryData.metadataCurrents||[]).map(t=>t.videoId).join('、');
+  el('metadataProgress').innerHTML=(remaining||m.failed||v.missing)?'<div class="current">已有文件元数据：已补齐 <b>'+Number(m.complete||0)+'</b> · 待处理 '+remaining+' · 失败 '+Number(m.failed||0)+(metadataNow?' · 当前 '+esc(metadataNow):'')+'<br>播放量：已同步 <b>'+Number(v.complete||0)+'</b> · 缺失 '+Number(v.missing||0)+' · 排队 '+Number(v.pending||0)+' · 同步失败 '+Number(v.failed||0)+'<div class="muted">下载和补齐合计最多 '+summaryData.maxConcurrentTasks+' 个活动任务；正常下载优先使用空位。</div></div>':'';
+  const pages=Math.max(1,Math.ceil(ledger.total/pageSize));page=Math.min(page,pages);
+  el('rows').innerHTML=ledger.tasks.length?ledger.tasks.map(t=>'<tr><td class="'+esc(t.state)+'">'+esc(stateNames[t.state]||t.state)+'</td>'+
+    '<td class="title"><b>'+esc(t.title||'标题尚未取得')+'</b><div class="muted">'+esc(t.videoId)+'</div></td>'+
+    '<td>'+esc(authorText(t))+'</td><td>'+esc(dateText(t.uploadTime))+'</td><td>'+esc(dateText(t.updatedAt))+'</td>'+
+    '<td class="'+esc(t.fileStatus||'unknown')+'">'+esc(fileNames[t.fileStatus]||'—')+'<div class="muted">'+esc(bytes(t.actualFileSize||t.totalLength))+'</div></td>'+
+    '<td>'+Number(t.attempts||0)+'</td><td>'+esc(t.message)+(t.metadataMessage?'<div class="muted">元数据：'+esc(t.metadataMessage)+'</div>':'')+(t.lastErrorCategory?'<div class="muted">错误分类：'+esc(errorNames[t.lastErrorCategory]||t.lastErrorCategory)+'</div>':'')+'</td><td><div class="actions">'+
+    (t.state==='completed'?'<a href="/playlist?play='+encodeURIComponent(t.id)+'&view=focus" target="_blank"><button>播放</button></a> ':'')+
+    (t.sourcePage?'<a href="'+esc(t.sourcePage)+'" target="_blank"><button>打开原网页</button></a> ':'')+
+    (t.state==='failed'?'<button onclick="retry(\\''+t.id+'\\')">重试</button>':'')+
+    (t.state==='completed'&&t.fileStatus&&t.fileStatus!=='present'?'<button onclick="redownload(\\''+t.id+'\\')">重新下载</button>':'')+'</div></td></tr>').join(''):
+    '<tr><td colspan="9" class="empty">没有符合条件的记录</td></tr>';
+  el('summary').textContent='共 '+ledger.total+' 条 · 第 '+page+' / '+pages+' 页';
+  el('previous').disabled=page<=1;el('next').disabled=page>=pages;
+}
+async function load(){if(loading){pendingLoad=true;return}loading=true;try{
+  const params=new URLSearchParams({query:el('query').value.trim(),state:el('stateFilter').value,author:el('authorFilter').value,sort:el('sortBy').value,direction:el('direction').value,page:String(page),pageSize:String(pageSize)});
+  [summaryData,ledger]=await Promise.all([(await fetch('/api/status')).json(),(await fetch('/api/ledger?'+params)).json()]);
+  const oldState=el('stateFilter').value;el('stateFilter').innerHTML='<option value="all">全部状态</option>'+Object.keys(summaryData.counts).map(k=>'<option value="'+esc(k)+'">'+esc(stateNames[k]||k)+'</option>').join('');el('stateFilter').value=oldState;
+  const oldAuthor=el('authorFilter').value;el('authorFilter').innerHTML='<option value="all">全部作者</option>'+ledger.authors.map(a=>'<option value="'+esc(a.author)+'">'+esc(a.alias?a.alias+' (@'+a.author+')':a.author)+' · '+a.count+'</option>').join('');el('authorFilter').value=ledger.authors.some(a=>a.author===oldAuthor)?oldAuthor:'all';
+  render();}finally{loading=false;if(pendingLoad){pendingLoad=false;load()}}
+}
+el('query').addEventListener('input',()=>{clearTimeout(inputTimer);inputTimer=setTimeout(()=>{page=1;load()},250)});
+['stateFilter','authorFilter','sortBy','direction'].forEach(id=>el(id).addEventListener('change',()=>{page=1;load()}));
+el('previous').onclick=()=>{if(page>1){page--;load()}};el('next').onclick=()=>{page++;load()};
+load();setInterval(load,2000)</script></main></html>`;
+}
+
+function playlistHtml() {
+  return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="idm-disable" content="true">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Iwara 本地播放列表</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f2f6fb;color:#26374d;font:14px/1.5 "Segoe UI","Microsoft YaHei",system-ui}header{position:sticky;top:0;z-index:5;background:rgba(255,255,255,.96);border-bottom:1px solid #dce6f1;padding:14px 24px;display:flex;gap:16px;align-items:center;flex-wrap:wrap}header h1{font-size:21px;color:#17365f;margin:0 12px 0 0}header input{width:min(420px,60vw)}input,select,button{font:inherit;border:1px solid #cad8e8;border-radius:9px;background:#fff;color:#30445e;padding:9px 11px;min-height:38px}button{cursor:pointer;font-weight:600}button:hover{border-color:#5b8def;background:#eef5ff}.layout{max-width:1600px;margin:0 auto;padding:22px;display:grid;grid-template-columns:minmax(0,1fr) 390px;gap:20px}.layout.focus-player{grid-template-columns:minmax(0,1fr)}.layout.focus-player>section{display:none}.layout.focus-player .player{position:relative;top:0;width:min(1120px,100%);margin:0 auto;padding:18px}.layout.focus-player .player video{max-height:calc(100vh - 220px);object-fit:contain}.layout.focus-player .upnext{max-height:300px;overflow:auto}.toolbar{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-bottom:16px}.toolbar .count{margin-left:auto;color:#71829a}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:15px}.card{background:#fff;border:1px solid #d9e4f0;border-radius:13px;overflow:hidden;cursor:pointer;box-shadow:0 4px 15px rgba(52,85,123,.07);transition:.15s}.card:hover,.card.active{border-color:#5b8def;transform:translateY(-2px);box-shadow:0 8px 22px rgba(49,101,185,.16)}.thumb{aspect-ratio:16/9;background:#dce8f4;position:relative;overflow:hidden}.thumb video{width:100%;height:100%;object-fit:cover;display:block}.badge{position:absolute;right:8px;bottom:7px;background:rgba(20,45,75,.75);color:#fff;padding:2px 6px;border-radius:5px;font-size:11px}.card-body{padding:10px 11px}.card-title{font-weight:700;color:#203957;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.meta{color:#72839a;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:4px}.empty{padding:50px;text-align:center;color:#7a899d;background:#fff;border:1px dashed #cbd8e6;border-radius:14px}.player{position:sticky;top:82px;background:#fff;border:1px solid #d9e4f0;border-radius:15px;padding:13px;box-shadow:0 5px 20px rgba(52,85,123,.1);height:max-content}.player video{display:block;width:100%;aspect-ratio:16/9;background:#dce8f4;border-radius:10px}.player h2{font-size:18px;line-height:1.35;margin:13px 0 6px;color:#17365f}.player-meta{color:#657890;display:flex;flex-wrap:wrap;gap:7px 13px}.player-actions{display:flex;gap:7px;margin-top:12px}.upnext{border-top:1px solid #e6edf5;margin-top:15px;padding-top:12px}.upnext h3{margin:0 0 9px;font-size:14px;color:#36516f}.next-row{display:flex;gap:9px;padding:7px 4px;border-radius:8px;cursor:pointer}.next-row:hover{background:#eef5ff}.next-row video{width:92px;height:52px;aspect-ratio:auto;border-radius:5px;object-fit:cover}.next-row b{display:block;font-size:12px;line-height:1.35;max-height:34px;overflow:hidden}.next-row span{display:block;color:#7a899d;font-size:11px}.status{margin:10px 0;color:#71829a;font-size:12px;min-height:18px}[id*="idm" i],[class*="idm" i],[id*="internet-download-manager" i],[class*="internet-download-manager" i]{display:none!important}@media(max-width:1050px){.layout{grid-template-columns:1fr}.player{position:relative;top:0;grid-row:1}.grid{grid-template-columns:repeat(auto-fill,minmax(190px,1fr))}}@media(max-width:600px){header{padding:12px 14px}.layout{padding:14px}.grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.card-body{padding:8px}.player{padding:9px}}</style>
+ <style>.single-mode header{justify-content:flex-start}.single-mode header input,.single-mode header select,.single-mode header #randomPage,.single-mode header #queueViews,.single-mode header #scriptLink{display:none}.single-mode .layout{padding-top:14px}.single-mode .player{box-shadow:0 8px 28px rgba(52,85,123,.12)}body:not(.single-mode) #layout>.player,body:not(.single-mode) #toggleView{display:none}body:not(.single-mode) .layout{display:block}.next-row.compact-row{align-items:center;border:1px solid #e6edf5;margin:4px 0;padding:8px 10px}.next-row.compact-row .compact-index{min-width:30px;color:#71829a;font-size:12px}</style>
+<header><h1>Iwara 本地播放列表</h1><input id="query" placeholder="搜索标题、作者或视频 ID"><select id="sort"><option value="updatedAt">最近下载</option><option value="title">标题</option><option value="author">作者</option><option value="uploadTime">上传日期</option><option value="views">播放量</option></select><select id="direction"><option value="desc">降序</option><option value="asc">升序</option></select><button id="toggleView" type="button" aria-pressed="false">大播放视角</button><button id="randomPage" type="button">随机一页（30）</button><button id="queueViews" type="button">同步缺失播放量</button><a href="/" target="_blank" id="ledgerLink"><button type="button">下载台账</button></a><a href="/IwaraResilientQueue.user.js" target="_blank" id="scriptLink"><button type="button">更新网页脚本</button></a></header>
+<div id="layout" class="layout"><section><div class="toolbar"><button id="refresh" type="button">刷新列表</button><button id="loadMore" type="button" hidden>加载更多</button><span class="count" id="count"></span></div><div id="grid" class="grid"></div><div id="status" class="status"></div></section><aside class="player"><video id="mainVideo" controls playsinline preload="metadata"></video><h2 id="mainTitle">选择一个视频开始播放</h2><div id="mainMeta" class="player-meta">本地文件播放 · 不依赖 Iwara 页面</div><div class="player-actions"><button id="openPage" type="button" disabled>打开原页面</button><button id="prevBtn" type="button" disabled>播放上一个</button><button id="nextBtn" type="button" disabled>播放下一个</button></div><div class="upnext"><h3>相邻视频</h3><div id="upnext"></div></div></aside></div>
+<script>
+const $=id=>document.getElementById(id), esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])), date=v=>v?new Date(v).toLocaleDateString('zh-CN'):'—', views=v=>v==null?'播放量待同步':Number(v).toLocaleString('zh-CN')+' 次播放';
+const routeParams=new URLSearchParams(location.search);
+let items=[],current=-1,timer,pageNo=Math.max(1,Number(routeParams.get('page')||1)||1),totalItems=0,loading=false,previewObserver=null,coverJobs=new WeakMap(),coverObjectUrls=new Set(),coverQueue=[],coverActive=0,coverLimit=3,pendingPlay=routeParams.get('play')||'',sourcePage=routeParams.get('from')||'',singleVideoMode=location.pathname==='/player'||Boolean(pendingPlay);
+let initialLoad=true;
+try{if(!sourcePage)sourcePage=sessionStorage.getItem('iwara-playlist-source')||''}catch{}
+function openStandalone(i){const t=items[i];if(!t)return;const from=location.pathname+location.search;try{sessionStorage.setItem('iwara-playlist-source',from)}catch{};const q=new URLSearchParams({play:t.id,from});window.location.href='/player?'+q.toString()}
+function backToSource(){const target=sourcePage||'/playlist';try{sessionStorage.removeItem('iwara-playlist-source')}catch{};window.location.replace(target)}
+function syncListUrl(){if(singleVideoMode)return;const q=new URLSearchParams();const query=$('query').value.trim(),sort=$('sort').value,direction=$('direction').value;if(query)q.set('query',query);if(sort!=='updatedAt')q.set('sort',sort);if(direction!=='desc')q.set('direction',direction);if(pageNo>1)q.set('page',String(pageNo));const next='/playlist'+(q.toString()?'?'+q.toString():'');history.replaceState(null,'',next)}
+function previewHolder(video){return video?.closest?.('.thumb,.next-row')||null}
+function isPreviewHovered(video){return Boolean(previewHolder(video)?.matches(':hover'))}
+function setCoverImage(video,url){const holder=previewHolder(video),image=holder?.querySelector('[data-cover-image]');if(!holder)return;const hovered=isPreviewHovered(video),next=holder.classList.contains('next-row');if(url){if(image){image.src=url;image.hidden=hovered;image.style.display=hovered?'none':'block'}if(next){video.style.display=hovered?'block':'none'}else video.style.visibility=hovered?'visible':'hidden'}else{if(image){image.removeAttribute('src');image.hidden=true;image.style.display='none'}video.style.display='block';video.style.visibility='visible'}}
+function releaseCover(video){const poster=video?.poster||'';if(poster&&coverObjectUrls.has(poster)){URL.revokeObjectURL(poster);coverObjectUrls.delete(poster)}if(video){setCoverImage(video,null);video.removeAttribute('poster');delete video.dataset.cover;video.pause();}}
+function releaseCovers(root){if(!root)return;if(root.matches?.('video'))releaseCover(root);root.querySelectorAll?.('video').forEach(releaseCover)}
+function releaseAllCovers(){releaseCovers(document);for(const url of coverObjectUrls)URL.revokeObjectURL(url);coverObjectUrls.clear();$('mainVideo')?.removeAttribute('poster')}
+function attachVideo(video){if(!video?.dataset.src||video.dataset.attached==='1')return;video.dataset.attached='1';video.preload='metadata';video.src=video.dataset.src;video.load()}
+function detachVideo(video){if(video?.dataset.attached==='1'&&['1','failed'].includes(video.dataset.cover)&&!isPreviewHovered(video)){const poster=video.poster;video.pause();video.removeAttribute('src');if(poster){video.removeAttribute('poster');video.poster=poster;video.load()}delete video.dataset.attached}}
+function randomFrameTime(duration){if(!Number.isFinite(duration)||duration<=0)return 0;const margin=duration>8?Math.min(2,duration*.08):Math.min(.05,duration/4);const end=Math.max(margin,duration-margin);return margin+Math.random()*Math.max(0,end-margin)}
+function runCoverCapture(video){return new Promise(resolve=>{let attempts=0,settled=false;const clean=()=>{video.removeEventListener('seeked',onSeeked);video.removeEventListener('error',onError)};const finish=url=>{if(settled)return;settled=true;clean();if(url){video.poster=url;video.dataset.cover='1';setCoverImage(video,url)}else video.dataset.cover='failed';delete video.dataset.covering;if(!isPreviewHovered(video))detachVideo(video);resolve(url)};const choose=()=>{if(settled)return;const duration=Number(video.duration);if(!Number.isFinite(duration)||duration<=0){finish(null);return}attempts+=1;const time=randomFrameTime(duration);if(Math.abs(video.currentTime-time)<.01&&video.readyState>=2){onSeeked();return}try{video.currentTime=time}catch{finish(null)}};const onSeeked=()=>{if(settled)return;const width=video.videoWidth,height=video.videoHeight;if(!width||!height){if(attempts<3){choose();return}finish(null);return}const canvas=document.createElement('canvas'),w=Math.min(width,640),h=Math.max(1,Math.round(height*w/width));canvas.width=w;canvas.height=h;try{const ctx=canvas.getContext('2d');ctx.drawImage(video,0,0,w,h);const sample=ctx.getImageData(0,0,Math.min(w,80),Math.min(h,80)).data;let sum=0,count=0;for(let i=0;i<sample.length;i+=4){sum+=sample[i]+sample[i+1]+sample[i+2];count+=3}if(count&&sum/count<8&&attempts<3){choose();return}const url=canvas.toDataURL('image/jpeg',.82);finish(url&&url!=='data:,'?url:null)}catch{finish(null)}};const onError=()=>finish(null);video.dataset.covering='1';video.addEventListener('loadedmetadata',choose,{once:true});video.addEventListener('seeked',onSeeked);video.addEventListener('error',onError,{once:true});attachVideo(video);if(video.readyState>=1&&Number.isFinite(video.duration))choose()})}
+function pumpCoverQueue(){while(coverActive<coverLimit&&coverQueue.length){const entry=coverQueue.shift();coverActive+=1;runCoverCapture(entry.video).then(entry.resolve,()=>entry.resolve(null)).finally(()=>{coverActive-=1;coverJobs.delete(entry.video);pumpCoverQueue()})}}
+function captureCover(video,force=false){if(!video?.dataset.src)return Promise.resolve(null);if(!force&&video.dataset.cover==='1')return Promise.resolve(video.poster||null);const running=coverJobs.get(video);if(running)return running;if(force)releaseCover(video);const job=new Promise(resolve=>{coverQueue.push({video,resolve});pumpCoverQueue()});coverJobs.set(video,job);return job}
+ function preparePreviews(){previewObserver?.disconnect();const videos=[...document.querySelectorAll('video[data-src]')];if(!videos.length)return;if(singleVideoMode){videos.forEach(video=>void captureCover(video));return}if(!('IntersectionObserver'in window))videos.slice(0,16).forEach(video=>void captureCover(video));else{previewObserver=new IntersectionObserver(entries=>entries.forEach(entry=>{if(entry.isIntersecting){void captureCover(entry.target);previewObserver.unobserve(entry.target)}}),{rootMargin:'240px 0px'});videos.forEach(video=>previewObserver.observe(video))}videos.forEach(video=>{const holder=previewHolder(video)||video;holder.onmouseenter=()=>{const image=holder.querySelector?.('[data-cover-image]');if(image){image.hidden=true;image.style.display='none'}video.style.display='block';video.style.visibility='visible';attachVideo(video);video.play().catch(()=>{})};holder.onmouseleave=()=>{video.pause();try{video.currentTime=0}catch{};detachVideo(video);if(video.dataset.cover==='1'&&video.poster)setCoverImage(video,video.poster)}})}
+function card(t,i){return '<article class="card '+(i===current?'active':'')+'" data-index="'+i+'"><div class="thumb"><video muted playsinline preload="none" data-src="'+esc(t.streamUrl)+'" aria-label="'+esc(t.title||t.videoId)+'"></video><img class="cover-image" data-cover-image alt="" aria-hidden="true" hidden style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;z-index:1"><span class="badge">本地</span></div><div class="card-body"><div class="card-title" title="'+esc(t.title||t.videoId)+'">'+esc(t.title||t.videoId)+'</div><div class="meta">'+esc(t.alias||t.author||'未知作者')+' · '+esc(date(t.uploadTime))+'</div><div class="meta">'+esc(views(t.views))+'</div></div></article>'}
+ function render(){releaseCovers($('grid'));releaseCovers($('upnext'));$('mainVideo').removeAttribute('poster');if(singleVideoMode){$('grid').innerHTML='';$('count').textContent='';$('loadMore').hidden=true}else{$('grid').innerHTML=items.length?items.map(card).join(''):'<div class="empty">没有可播放的本地视频</div>';$('count').textContent=(totalItems&&items.length<totalItems?items.length+' / ':'')+(totalItems||items.length)+' 个本地视频';$('loadMore').hidden=items.length>=totalItems||!totalItems}document.querySelectorAll('.card').forEach(c=>c.onclick=e=>{const i=Number(c.dataset.index);if(singleVideoMode)select(i,e);else openStandalone(i)});renderNext();preparePreviews()}
+ function renderNext(){releaseCovers($('upnext'));if(!singleVideoMode){$('upnext').innerHTML='';return}const available=items.map((t,index)=>({t,index})).filter(x=>x.index!==current).sort((a,b)=>Math.abs(a.index-current)-Math.abs(b.index-current)).slice(0,4);$('upnext').innerHTML=available.map(({t,index})=>'<div class="next-row compact-row" data-index="'+index+'"><span class="compact-index">'+(index<current?'上一个':'下一个')+'</span><video muted playsinline preload="none" data-src="'+esc(t.streamUrl)+'" aria-label="'+esc(t.title||t.videoId)+'" style="display:none"></video><img class="cover-image" data-cover-image alt="" aria-hidden="true" hidden style="width:92px;height:52px;object-fit:cover;border-radius:5px"><div><b>'+esc(t.title||t.videoId)+'</b><span>'+esc(t.alias||t.author||'未知作者')+'</span></div></div>').join('')||'<div class="meta">没有相邻视频</div>';document.querySelectorAll('.next-row').forEach(c=>c.onclick=e=>select(Number(c.dataset.index),e))}
+ function select(i,event,fromUser=false){if(event){event.preventDefault();event.stopPropagation()}if(!items[i])return;current=i;const t=items[i],v=$('mainVideo'),cardVideo=document.querySelector('.card[data-index="'+i+'"] video');if(cardVideo?.poster)v.poster=cardVideo.poster;if(event||fromUser){v.muted=false;v.autoplay=false}if(singleVideoMode){const q=new URLSearchParams(location.search);q.set('play',t.id);history.replaceState(null,'','/player?'+q.toString())}v.src=t.streamUrl;v.load();v.play().catch(()=>{});$('mainTitle').textContent=t.title||t.videoId;$('mainMeta').innerHTML='<span>'+esc(t.alias||t.author||'未知作者')+'</span><span>'+esc(date(t.uploadTime))+'</span><span>'+esc(views(t.views))+'</span><span>'+esc(t.localFileName||'本地文件')+'</span>';$('openPage').disabled=!t.sourcePage;$('openPage').onclick=()=>window.open(t.sourcePage,'_blank','noopener');$('prevBtn').disabled=current<=0;$('prevBtn').onclick=()=>select(current-1,null,true);$('nextBtn').disabled=current<0||current>=items.length-1;$('nextBtn').onclick=()=>select(current+1,null,true);document.querySelectorAll('.card').forEach(c=>c.classList.toggle('active',Number(c.dataset.index)===current));renderNext();preparePreviews()}
+ async function load(reset=true,randomize=false){if(loading)return;clearTimeout(timer);if(reset){if(!(initialLoad&&!randomize&&!singleVideoMode))pageNo=1;items=[];current=-1}loading=true;const targetPlay=pendingPlay;$('status').textContent=targetPlay?'正在打开指定本地视频…':(randomize?'正在随机读取一页视频…':'正在读取本地列表…');const p=new URLSearchParams({query:singleVideoMode?'':$('query').value.trim(),sort:$('sort').value,direction:$('direction').value,page:String(pageNo),pageSize:'30'});if(targetPlay){p.set('contextId',targetPlay);p.set('contextSize','5')}else if(randomize)p.set('randomPage','1');try{const r=await fetch('/playlist-data?'+p,{cache:'no-store'});const d=await r.json();if(!r.ok)throw Error(d.error||r.status);totalItems=Number(d.total||0);pageNo=Number(d.page||pageNo);items=reset?(d.items||[]):items.concat(d.items||[]);if(targetPlay){pendingPlay='';current=Number.isInteger(Number(d.currentIndex))&&Number(d.currentIndex)>=0?Number(d.currentIndex):0;setViewMode('focus');$('mainVideo').muted=true;$('mainVideo').autoplay=true;render();if(items.length){select(Math.min(current,items.length-1));$('status').textContent='已打开独立播放器；播放列表已释放，仅保留相邻视频切换。'}else $('status').textContent='找不到对应的本地文件，可能已移动或缺失。'}else{$('status').textContent=(randomize?'本次已随机打开第 '+pageNo+' 页（封面为随机帧，关闭页面后自动清理）':'本地源已就绪；封面为本次打开随机帧，关闭页面后自动清理；历史缺失播放量显示“播放量待同步”。');render();syncListUrl()}}catch(e){$('status').textContent='读取失败：'+e.message}finally{loading=false;initialLoad=false}}
+ function setViewMode(mode){const focus=singleVideoMode||mode==='focus';$('layout').classList.toggle('focus-player',focus);const button=$('toggleView');button.textContent=singleVideoMode?'返回播放列表':(focus?'返回列表':'大播放视角');button.setAttribute('aria-pressed',String(focus));try{if(!singleVideoMode)localStorage.setItem('iwara-player-view',focus?'focus':'split')}catch{}}
+async function queueViews(){const r=await(await fetch('/api/enrich/queue-views',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})})).json();$('status').textContent='已加入 '+Number(r.queued||0)+' 条播放量同步任务'+(r.remaining?'，尚有 '+r.remaining+' 条待加入':'')+'；保持任一 Iwara 视频页打开即可逐步处理。'}
+function stripIdmPanels(root=document){for(const node of root.querySelectorAll?.('*')||[]){const marker=(node.id||'')+' '+(typeof node.className==='string'?node.className:'');if(/\bidm\b|internet-download-manager|download-manager/i.test(marker)&&node!==document.body&&node!==document.documentElement)node.remove()}}
+stripIdmPanels();new MutationObserver(mutations=>mutations.forEach(m=>m.addedNodes.forEach(n=>{if(n.nodeType===1){stripIdmPanels(n);const marker=(n.id||'')+' '+(typeof n.className==='string'?n.className:'');if(/\bidm\b|internet-download-manager|download-manager/i.test(marker))n.remove()}}))).observe(document.documentElement,{subtree:true,childList:true});
+ $('toggleView').onclick=()=>{if(singleVideoMode){backToSource();return}const isFocus=$('layout').classList.contains('focus-player');setViewMode(isFocus?'split':'focus')};$('randomPage').onclick=()=>load(true,true);$('queueViews').onclick=queueViews;$('refresh').onclick=()=>load(true);$('loadMore').onclick=()=>{pageNo+=1;load(false)};$('query').oninput=()=>{clearTimeout(timer);timer=setTimeout(()=>load(true),250)};['sort','direction'].forEach(id=>$(id).onchange=()=>load(true));$('mainVideo').onended=()=>{if(current<items.length-1)select(current+1)};window.addEventListener('pagehide',releaseAllCovers,{once:true});window.addEventListener('beforeunload',releaseAllCovers,{once:true});if(!singleVideoMode){$('query').value=routeParams.get('query')||'';$('sort').value=routeParams.get('sort')||'updatedAt';$('direction').value=routeParams.get('direction')||'desc'}document.body.classList.toggle('single-mode',singleVideoMode);if(singleVideoMode){setViewMode('focus');if(pendingPlay)load(true,false);else{render();$('status').textContent='请从播放列表选择一个视频。'}}else{try{setViewMode(localStorage.getItem('iwara-player-view')||'split')}catch{setViewMode('split')}load(true,!(routeParams.has('page')||routeParams.has('query')||routeParams.has('sort')||routeParams.has('direction')))}
+</script></html>`;
+}
+
+async function serveLocalMedia(request, response, scheduler, encodedId) {
+  try {
+    const media = await scheduler.mediaPath(decodeURIComponent(encodedId));
+    const info = await stat(media.path);
+    const total = info.size;
+    const baseHeaders = {
+      "content-type": "video/mp4",
+      "accept-ranges": "bytes",
+      "cache-control": "private, max-age=3600",
+      "content-disposition": `inline; filename*=UTF-8''${encodeURIComponent(media.name)}`
+    };
+    const range = request.headers.range;
+    if (!range) {
+      response.writeHead(200, { ...baseHeaders, "content-length": total });
+      if (request.method === "HEAD") return response.end();
+      createReadStream(media.path).pipe(response);
+      return;
+    }
+    const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+    if (!match) {
+      response.writeHead(416, { "content-range": `bytes */${total}` });
+      return response.end();
+    }
+    const start = match[1] ? Number(match[1]) : Math.max(0, total - Number(match[2] || 0));
+    const end = match[2] ? Number(match[2]) : total - 1;
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start || start >= total) {
+      response.writeHead(416, { "content-range": `bytes */${total}` });
+      return response.end();
+    }
+    const boundedEnd = Math.min(end, total - 1);
+    response.writeHead(206, {
+      ...baseHeaders,
+      "content-length": boundedEnd - start + 1,
+      "content-range": `bytes ${start}-${boundedEnd}/${total}`
+    });
+    if (request.method === "HEAD") return response.end();
+    createReadStream(media.path, { start, end: boundedEnd }).pipe(response);
+  } catch (error) {
+    sendJson(response, error.message === "本地视频不存在" ? 404 : 403, { error: error.message });
+  }
+}
+
+export function createServer({ scheduler, host, port, onShutdown }) {
+  const server = http.createServer(async (request, response) => {
+    const origin = request.headers.origin || "";
+    const reply = (status, payload) => sendJson(response, status, payload, origin);
+    try {
+      if (!allowedOrigin(origin)) {
+        reply(403, { error: "origin not allowed" });
+        return;
+      }
+      if (request.method === "OPTIONS") {
+        const headers = {
+          "access-control-allow-headers": "content-type",
+          "access-control-allow-methods": "GET,POST,OPTIONS"
+        };
+        if (origin) headers["access-control-allow-origin"] = origin;
+        response.writeHead(204, headers);
+        response.end();
+        return;
+      }
+      const url = new URL(request.url, `http://${request.headers.host}`);
+      if (request.method === "GET" && url.pathname === "/") {
+        const body = dashboardHtml();
+        response.writeHead(200, {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-store",
+          "x-content-type-options": "nosniff",
+          "x-frame-options": "DENY",
+          "referrer-policy": "no-referrer",
+          "content-security-policy": "default-src 'self'; media-src 'self' blob:; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; object-src 'none'; frame-src 'none'"
+        });
+        response.end(body);
+      } else if (request.method === "GET" && ["/player", "/playlist", "/playlist.html"].includes(url.pathname)) {
+        const body = playlistHtml();
+        response.writeHead(200, {
+          "content-type": "text/html; charset=utf-8",
+          "cache-control": "no-store",
+          "x-content-type-options": "nosniff",
+          "x-frame-options": "DENY",
+          "referrer-policy": "no-referrer",
+          "content-security-policy": "default-src 'self'; media-src 'self' blob:; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; object-src 'none'; frame-src 'none'"
+        });
+        response.end(body);
+      } else if ((request.method === "GET" || request.method === "HEAD") && url.pathname.startsWith("/media/")) {
+        await serveLocalMedia(request, response, scheduler, url.pathname.slice("/media/".length));
+      } else if (request.method === "GET" && ["/api/playlist", "/playlist-data"].includes(url.pathname)) {
+        // Navigating to the JSON endpoint directly in Chrome sends an HTML
+        // Accept header.  Redirect that human navigation to the usable page;
+        // fetch() from the playlist uses /playlist-data and still receives JSON.
+        if (url.pathname === "/api/playlist" && String(request.headers.accept || "").includes("text/html")) {
+          response.writeHead(302, { location: "/playlist", "cache-control": "no-store" });
+          response.end();
+          return;
+        }
+        reply(200, await scheduler.playlist({
+          query: url.searchParams.get("query") || "",
+          author: url.searchParams.get("author") || "all",
+          taskId: url.searchParams.get("taskId") || "",
+          contextId: url.searchParams.get("contextId") || "",
+          contextSize: Number(url.searchParams.get("contextSize") || 5),
+          sort: url.searchParams.get("sort") || "updatedAt",
+          direction: url.searchParams.get("direction") || "desc",
+          page: Number(url.searchParams.get("page") || 1),
+          pageSize: Number(url.searchParams.get("pageSize") || 25),
+          randomPage: ["1", "true", "yes"].includes(String(url.searchParams.get("randomPage") || "").toLowerCase())
+        }));
+      } else if (request.method === "POST" && url.pathname === "/api/views") {
+        const body = await readJson(request);
+        reply(200, await scheduler.updateViewCount(body.videoId, body.views));
+      } else if (request.method === "GET" && url.pathname === "/IwaraResilientQueue.user.js") {
+        const body = await readFile(path.resolve(import.meta.dirname, "..", "IwaraResilientQueue.user.js"));
+        response.writeHead(200, {
+          "content-type": "application/javascript; charset=utf-8",
+          "content-length": body.length,
+          "cache-control": "no-store"
+        });
+        response.end(body);
+      } else if (request.method === "GET" && url.pathname === "/health") {
+        reply(200, { ok: true, service: "iwara-resilient-queue", version: "1.10.0" });
+      } else if (request.method === "GET" && url.pathname === "/api/status") {
+        reply(200, scheduler.status());
+      } else if (request.method === "GET" && url.pathname === "/api/ledger") {
+        reply(200, scheduler.ledger({
+          query: url.searchParams.get("query") || "",
+          state: url.searchParams.get("state") || "all",
+          author: url.searchParams.get("author") || "all",
+          sort: url.searchParams.get("sort") || "updatedAt",
+          direction: url.searchParams.get("direction") || "desc",
+          page: Number(url.searchParams.get("page") || 1),
+          pageSize: Number(url.searchParams.get("pageSize") || 50)
+        }));
+      } else if (request.method === "GET" && url.pathname === "/api/author-categories") {
+        reply(200, scheduler.authorClassificationCandidates(
+          Number(url.searchParams.get("minCount") || 10)
+        ));
+      } else if (request.method === "POST" && url.pathname === "/api/author-categories/preview") {
+        const body = await readJson(request);
+        reply(200, await scheduler.previewAuthorClassification(body.rules, body.minCount));
+      } else if (request.method === "POST" && url.pathname === "/api/author-categories/apply") {
+        const body = await readJson(request);
+        reply(200, await scheduler.applyAuthorClassification(body.rules, body.minCount));
+      } else if (request.method === "GET" && url.pathname.startsWith("/api/attempts/")) {
+        reply(200, scheduler.attemptHistory(url.pathname.split("/").pop()));
+      } else if (request.method === "POST" && url.pathname === "/api/tasks") {
+        const body = await readJson(request);
+        reply(202, await scheduler.enqueue(body.items || []));
+      } else if (request.method === "GET" && url.pathname === "/api/resolve/next") {
+        reply(200, { task: await scheduler.leaseNext() });
+      } else if (request.method === "POST" && url.pathname === "/api/resolve/result") {
+        reply(200, await scheduler.submitResolution(await readJson(request)));
+      } else if (request.method === "GET" && url.pathname === "/api/enrich/next") {
+        reply(200, { task: await scheduler.leaseMetadataEnrichment() });
+      } else if (request.method === "POST" && url.pathname === "/api/enrich/result") {
+        reply(200, await scheduler.submitMetadataEnrichment(await readJson(request)));
+      } else if (request.method === "POST" && url.pathname === "/api/enrich/retry-failed") {
+        reply(200, await scheduler.retryFailedMetadata());
+      } else if (request.method === "POST" && url.pathname === "/api/enrich/queue-views") {
+        const body = await readJson(request);
+        reply(200, await scheduler.queueViewCountEnrichment(body.limit));
+      } else if (request.method === "POST" && url.pathname.startsWith("/api/retry/")) {
+        reply(200, await scheduler.retryTask(url.pathname.split("/").pop()));
+      } else if (request.method === "POST" && url.pathname.startsWith("/api/redownload/")) {
+        reply(200, await scheduler.redownloadTask(url.pathname.split("/").pop()));
+      } else if (request.method === "POST" && url.pathname === "/api/verify-files") {
+        reply(200, await scheduler.verifyFiles());
+      } else if (request.method === "POST" && url.pathname === "/api/open-download-directory") {
+        reply(200, await scheduler.openDownloadDirectory());
+      } else if (request.method === "POST" && url.pathname === "/api/shutdown") {
+        reply(200, { ok: true });
+        setImmediate(onShutdown);
+      } else {
+        reply(404, { error: "not found" });
+      }
+    } catch (error) {
+      reply(400, { error: error.message });
+    }
+  });
+  return {
+    server,
+    listen: () => new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(port, host, resolve);
+    }),
+    close: () => new Promise(resolve => server.close(resolve))
+  };
+}
