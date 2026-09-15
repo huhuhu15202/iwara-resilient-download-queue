@@ -209,6 +209,7 @@ async function main() {
     host: config.serviceHost,
     port: config.servicePort,
     accessToken: config.lanAccessToken,
+    ffmpeg,
     onShutdown: shutdown
   });
   await httpServer.listen();
