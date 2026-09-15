@@ -1,23 +1,85 @@
 import http from "node:http";
 import { createReadStream } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
+import { timingSafeEqual } from "node:crypto";
+import { networkInterfaces } from "node:os";
 import path from "node:path";
 
-const SERVICE_VERSION = "1.10.3";
+const SERVICE_VERSION = "1.11.0";
 
-function allowedOrigin(origin) {
+function normalizeAddress(address = "") {
+  const value = String(address || "").trim().toLowerCase();
+  return value.startsWith("::ffff:") ? value.slice(7) : value;
+}
+
+export function isLoopbackAddress(address = "") {
+  const value = normalizeAddress(address);
+  return value === "127.0.0.1" || value === "::1" || value === "localhost";
+}
+
+function isPrivateAddress(address = "") {
+  const value = normalizeAddress(address).replace(/^\[|\]$/g, "");
+  if (isLoopbackAddress(value) || value === "0.0.0.0") return true;
+  if (/^(10|192\.168|169\.254)\./.test(value)) return true;
+  if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(value)) return true;
+  return value.startsWith("fe80:") || value.startsWith("fc") || value.startsWith("fd");
+}
+
+function requestHostName(host = "") {
+  const value = String(host || "").trim().toLowerCase();
+  if (value.startsWith("[")) return value.slice(1, value.indexOf("]"));
+  return value.split(":")[0];
+}
+
+export function allowedOrigin(origin, requestHost = "") {
   if (!origin) return true;
   try {
     const parsed = new URL(origin);
     if (parsed.protocol === "chrome-extension:" && parsed.hostname === "dhdgffkkebhmkfjojejmpbldmpobfkfo") return true;
     if (["127.0.0.1", "localhost"].includes(parsed.hostname)) return true;
+    if (parsed.protocol === "http:" && (isPrivateAddress(parsed.hostname) || parsed.hostname === requestHostName(requestHost))) return true;
     return parsed.protocol === "https:" && (parsed.hostname === "iwara.tv" || parsed.hostname.endsWith(".iwara.tv"));
   } catch {
     return false;
   }
 }
 
-function sendJson(response, status, payload, origin = "") {
+function tokenMatches(expected, candidate) {
+  const left = Buffer.from(String(expected || ""));
+  const right = Buffer.from(String(candidate || ""));
+  return left.length > 0 && left.length === right.length && timingSafeEqual(left, right);
+}
+
+function requestCookies(header = "") {
+  return Object.fromEntries(String(header || "").split(";").map(part => {
+    const index = part.indexOf("=");
+    return index > 0 ? [part.slice(0, index).trim(), part.slice(index + 1).trim()] : ["", ""];
+  }).filter(([name]) => name));
+}
+
+export function authorizeRequest(request, url, accessToken = "") {
+  const token = String(accessToken || "").trim();
+  if (!token || isLoopbackAddress(request.socket?.remoteAddress || "")) return { ok: true, viaQuery: false };
+  const queryToken = url?.searchParams?.get("access_token") || url?.searchParams?.get("token") || "";
+  const headerToken = request.headers["x-iwara-access-token"] || "";
+  const cookieToken = requestCookies(request.headers.cookie || "").iwara_lan_token || "";
+  const candidate = headerToken || cookieToken || queryToken;
+  return { ok: tokenMatches(token, candidate), viaQuery: Boolean(queryToken && tokenMatches(token, queryToken)) };
+}
+
+function localLanAddresses() {
+  const addresses = [];
+  for (const entries of Object.values(networkInterfaces())) {
+    for (const entry of entries || []) {
+      if (!entry || entry.internal) continue;
+      const address = String(entry.address || "").trim();
+      if (address && !address.includes(":") && isPrivateAddress(address)) addresses.push(address);
+    }
+  }
+  return [...new Set(addresses)];
+}
+
+function sendJson(response, status, payload, origin = "", requestHost = "") {
   const body = JSON.stringify(payload);
   const headers = {
     "content-type": "application/json; charset=utf-8",
@@ -28,7 +90,7 @@ function sendJson(response, status, payload, origin = "") {
     "content-disposition": "inline",
     "x-content-type-options": "nosniff"
   };
-  if (origin && allowedOrigin(origin)) {
+  if (origin && allowedOrigin(origin, requestHost)) {
     headers["access-control-allow-origin"] = origin;
     headers["vary"] = "Origin";
   }
@@ -69,7 +131,7 @@ td.completed{color:#25835a;font-weight:700}td.failed{color:#c74444;font-weight:7
 .modal-backdrop{position:fixed;inset:0;z-index:20;background:rgba(35,50,71,.35);display:none;align-items:center;justify-content:center;padding:18px}.modal-backdrop.open{display:flex}.modal{width:min(980px,100%);max-height:90vh;overflow:auto;background:#f8fbff;border-radius:18px;padding:20px;box-shadow:0 24px 70px rgba(29,52,84,.3)}.modal h2{margin:0 0 5px;color:#17365f}.modal-tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:14px 0}.modal-tools input{min-width:240px;flex:1}.author-grid{display:grid;gap:8px}.author-row{display:grid;grid-template-columns:32px minmax(190px,1fr) 110px 125px minmax(210px,1.2fr);gap:9px;align-items:center;background:#fff;border:1px solid #dfe7f1;border-radius:11px;padding:9px 11px}.author-row input[type=checkbox]{min-height:auto;width:18px;height:18px}.author-row input[type=text]{width:100%}.modal-actions{position:sticky;bottom:-20px;display:flex;justify-content:flex-end;gap:8px;background:#f8fbff;padding:14px 0 0}.preview{white-space:pre-wrap;background:#eef5ff;border-radius:10px;padding:11px 13px;color:#36516f;margin-top:12px}
 @media(max-width:900px){main{padding:14px}.filters{grid-template-columns:1fr 1fr}.filters input{grid-column:1/-1}.pager{align-items:flex-start;flex-direction:column}h1{font-size:23px}}
 @media(max-width:700px){.author-row{grid-template-columns:28px 1fr}.author-row>*:nth-child(n+3){grid-column:2}.filters{grid-template-columns:1fr}.cards{grid-template-columns:1fr 1fr}}
-</style><main><h1>Iwara 稳定下载台账</h1><p class="hint">成功与失败记录都会永久保留；同一视频 ID 不会重复下载。 <button onclick="openDownloadDirectory()">打开视频目录</button> <a href="/playlist" target="_blank"><button>打开本地播放列表</button></a> <a href="/IwaraResilientQueue.user.js"><button>安装 / 更新网页脚本</button></a></p>
+</style><main><h1>Iwara 稳定下载台账</h1><p class="hint">成功与失败记录都会永久保留；同一视频 ID 不会重复下载。 <button onclick="openDownloadDirectory()">打开视频目录</button> <a href="/playlist" target="_blank"><button>打开本地播放列表</button></a> <button onclick="showLanAccess()">显示局域网播放链接</button> <a href="/IwaraResilientQueue.user.js"><button>安装 / 更新网页脚本</button></a> <span id="lanInfo"></span></p>
 <div class="cards" id="cards"></div><div id="current"></div><div id="metadataProgress"></div>
 <div class="filters">
   <input id="query" placeholder="搜索标题、作者或视频 ID">
@@ -107,6 +169,7 @@ async function retry(id){await fetch('/api/retry/'+id,{method:'POST'});await loa
 async function redownload(id){if(confirm('记录对应的文件缺失，确定重新下载？')){await fetch('/api/redownload/'+id,{method:'POST'});await load()}}
 async function verifyFiles(){const r=await(await fetch('/api/verify-files',{method:'POST'})).json();alert('检查完成：正常 '+r.present+'，缺失 '+r.missing+'，大小异常 '+r.sizeMismatch);await load()}
 async function openDownloadDirectory(){const r=await fetch('/api/open-download-directory',{method:'POST'});if(!r.ok){const body=await r.json();alert('打开目录失败：'+(body.error||r.status))}}
+async function showLanAccess(){const target=el('lanInfo');try{const r=await fetch('/api/lan-info',{cache:'no-store'});const data=await r.json();if(!r.ok)throw Error(data.error||r.status);if(!data.enabled){target.textContent='局域网未开启（将 serviceHost 改为 0.0.0.0 后重启）';return}target.textContent='局域网播放：'+(data.urls||[]).join(' ｜ ')}catch(e){target.textContent='读取局域网链接失败：'+e.message}}
 async function retryMetadata(){const r=await(await fetch('/api/enrich/retry-failed',{method:'POST'})).json();alert('已将 '+r.count+' 条补齐失败记录放回队列');await load()}
 async function queueViews(){const r=await(await fetch('/api/enrich/queue-views',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})})).json();alert('已加入 '+r.queued+' 条播放量同步任务'+(r.remaining?'，尚有 '+r.remaining+' 条待加入':'')+'。保持任一 Iwara 视频页打开，网页脚本会以最多 3 个并发逐步处理。');await load()}
 async function history(id){const list=await(await fetch('/api/attempts/'+id)).json();alert(list.length?list.map(x=>dateText(x.createdAt)+' · 第'+x.attemptNo+'次 · '+x.phase+' · '+x.outcome+(x.sourceHost?' · '+x.sourceHost:'')+(x.message?'\\n'+x.message:'')).join('\\n\\n'):'尚无尝试明细')}
@@ -304,13 +367,38 @@ async function serveLocalMedia(request, response, scheduler, encodedId) {
   }
 }
 
-export function createServer({ scheduler, host, port, onShutdown }) {
+export function createServer({ scheduler, host, port, accessToken = "", onShutdown }) {
   const server = http.createServer(async (request, response) => {
     const origin = request.headers.origin || "";
-    const reply = (status, payload) => sendJson(response, status, payload, origin);
+    const reply = (status, payload) => sendJson(response, status, payload, origin, request.headers.host || "");
     try {
-      if (!allowedOrigin(origin)) {
+      const url = new URL(request.url, `http://${request.headers.host}`);
+      if (!allowedOrigin(origin, request.headers.host || "")) {
         reply(403, { error: "origin not allowed" });
+        return;
+      }
+      const auth = authorizeRequest(request, url, accessToken);
+      if (!auth.ok) {
+        const body = JSON.stringify({ error: "需要局域网访问令牌", hint: "请使用服务日志中的局域网播放链接访问" });
+        response.writeHead(401, {
+          "content-type": "application/json; charset=utf-8",
+          "content-length": Buffer.byteLength(body),
+          "cache-control": "no-store",
+          "www-authenticate": "Bearer"
+        });
+        response.end(body);
+        return;
+      }
+      if (auth.viaQuery && request.method === "GET" && ["/", "/playlist", "/playlist.html"].includes(url.pathname)) {
+        url.searchParams.delete("access_token");
+        url.searchParams.delete("token");
+        const location = `${url.pathname}${url.search ? `?${url.searchParams}` : ""}`;
+        response.writeHead(302, {
+          location,
+          "cache-control": "no-store",
+          "set-cookie": "iwara_lan_token=" + encodeURIComponent(String(accessToken)) + "; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000"
+        });
+        response.end();
         return;
       }
       if (request.method === "OPTIONS") {
@@ -323,7 +411,6 @@ export function createServer({ scheduler, host, port, onShutdown }) {
         response.end();
         return;
       }
-      const url = new URL(request.url, `http://${request.headers.host}`);
       if (request.method === "GET" && url.pathname === "/") {
         const body = dashboardHtml();
         response.writeHead(200, {
@@ -389,6 +476,13 @@ export function createServer({ scheduler, host, port, onShutdown }) {
         response.end(body);
       } else if (request.method === "GET" && url.pathname === "/health") {
         reply(200, { ok: true, service: "iwara-resilient-queue", version: SERVICE_VERSION });
+      } else if (request.method === "GET" && url.pathname === "/api/lan-info") {
+        const token = String(accessToken || "").trim();
+        const encodedToken = encodeURIComponent(token);
+        const urls = token
+          ? localLanAddresses().map(address => `http://${address}:${port}/playlist?access_token=${encodedToken}`)
+          : [];
+        reply(200, { enabled: Boolean(token), urls, host, port });
       } else if (request.method === "GET" && url.pathname === "/api/status") {
         reply(200, scheduler.status());
       } else if (request.method === "GET" && url.pathname === "/api/ledger") {

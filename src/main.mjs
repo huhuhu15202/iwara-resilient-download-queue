@@ -2,6 +2,7 @@ import { access, mkdir, readFile, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { networkInterfaces } from "node:os";
 import path from "node:path";
 import { Aria2Client } from "./aria2-client.mjs";
 import { SQLiteStore } from "./sqlite-store.mjs";
@@ -27,6 +28,26 @@ async function exists(filePath) {
   }
 }
 
+function isLoopbackHost(host = "") {
+  const value = String(host || "").trim().toLowerCase();
+  return value === "127.0.0.1" || value === "localhost" || value === "::1" || value === "[::1]";
+}
+
+function localLanAddresses() {
+  const addresses = [];
+  for (const entries of Object.values(networkInterfaces())) {
+    for (const entry of entries || []) {
+      if (!entry || entry.internal) continue;
+      const address = String(entry.address || "").trim();
+      if (!address || address.includes(":")) continue;
+      if (/^(10|192\.168|169\.254)\./.test(address) || /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(address)) {
+        addresses.push(address);
+      }
+    }
+  }
+  return [...new Set(addresses)];
+}
+
 async function loadConfig() {
   const defaults = {
     dataRoot: envValue("IWARA_DATA_ROOT") || defaultDataRoot,
@@ -49,7 +70,11 @@ async function loadConfig() {
     browserFallbackEnabled: true,
     browserFallbackTimeoutMs: 45000,
     minValidMediaBytes: 65536,
-    ffmpegPath: ""
+    ffmpegPath: "",
+    // Keep the service loopback-only by default.  When serviceHost is changed
+    // to 0.0.0.0 or a LAN address, a persistent token protects non-loopback
+    // clients from download-management actions.
+    lanAccessToken: ""
   };
   const candidates = configOverride
     ? [configOverride]
@@ -81,13 +106,18 @@ async function loadConfig() {
     const value = Number(envValue(name));
     if (Number.isInteger(value) && value > 0) merged[key] = value;
   }
+  const missingDefault = Object.keys(defaults).some(key => !(key in current));
+  let shouldWriteConfig = !Object.keys(current).length || missingDefault;
+  if (!isLoopbackHost(merged.serviceHost) && !String(merged.lanAccessToken || "").trim()) {
+    merged.lanAccessToken = randomBytes(24).toString("hex");
+    shouldWriteConfig = true;
+  }
   merged.dataRoot = path.resolve(appRoot, String(merged.dataRoot || defaultDataRoot));
   merged.downloadRoot = path.resolve(appRoot, String(merged.downloadRoot || defaultDownloadRoot));
   merged.enginePath = path.resolve(appRoot, String(merged.enginePath || defaultEngine));
   await mkdir(merged.dataRoot, { recursive: true });
   await mkdir(path.dirname(configPath), { recursive: true });
-  const missingDefault = Object.keys(defaults).some(key => !(key in current));
-  if (!Object.keys(current).length || missingDefault) {
+  if (shouldWriteConfig) {
     await writeFile(configPath, JSON.stringify(merged, null, 2), "utf8");
   }
   return merged;
@@ -178,10 +208,18 @@ async function main() {
     scheduler,
     host: config.serviceHost,
     port: config.servicePort,
+    accessToken: config.lanAccessToken,
     onShutdown: shutdown
   });
   await httpServer.listen();
-  console.log(`Iwara 稳定下载队列：http://${config.serviceHost}:${config.servicePort}/`);
+  console.log(`Iwara 稳定下载队列：http://127.0.0.1:${config.servicePort}/`);
+  if (!isLoopbackHost(config.serviceHost)) {
+    const token = encodeURIComponent(String(config.lanAccessToken || ""));
+    const urls = localLanAddresses().map(address => `http://${address}:${config.servicePort}/playlist?access_token=${token}`);
+    console.log(`局域网播放令牌已启用；请仅在可信局域网内使用以下链接：`);
+    if (urls.length) urls.forEach(url => console.log(`局域网播放：${url}`));
+    else console.log(`局域网播放：http://<本机局域网IP>:${config.servicePort}/playlist?access_token=${token}`);
+  }
   console.log(`下载目录：${config.downloadRoot}`);
   console.log(`已有文件扫描：${importSummary.scanned}，新建档：${importSummary.imported}，未识别：${importSummary.unmatched}`);
   process.on("SIGINT", shutdown);

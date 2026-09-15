@@ -3,6 +3,7 @@
   "downloadRoot": "F:\\Video",
   "enginePath": "C:\\Program Files\\MotrixNext\\motrix-next-engine.exe",
   "serviceHost": "127.0.0.1",
+  "lanAccessToken": "",
   "servicePort": 18777,
   "aria2Port": 16801,
   "maxAttempts": 6,
