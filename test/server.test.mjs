@@ -115,6 +115,9 @@ test("playlist resource URLs and media ranges work without changing the stored v
     const script = /<script>([\s\S]*?)<\/script>/.exec(page.body)?.[1];
     assert.ok(script);
     assert.doesNotThrow(() => new Script(script));
+    assert.match(page.body, /id="loadSentinel"/);
+    assert.match(page.body, /IntersectionObserver/);
+    assert.match(page.body, /@media\(max-width:600px\)\{header\{position:relative/);
     const head = await request(port, item.streamUrl, { range: "bytes=100-" }, "HEAD");
     assert.equal(head.status, 206);
     assert.equal(head.headers["content-range"], "bytes 100-8191/8192");
