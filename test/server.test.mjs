@@ -34,6 +34,7 @@ test("LAN origin and token helpers only accept private/authorized clients", () =
   assert.equal(isLoopbackAddress("::ffff:127.0.0.1"), true);
   assert.equal(isLoopbackAddress("192.168.1.10"), false);
   assert.equal(allowedOrigin("http://192.168.1.10:18777", "192.168.1.10:18777"), true);
+  assert.equal(allowedOrigin("http://100.114.82.98:18777", "100.114.82.98:18777"), true);
   assert.equal(allowedOrigin("https://example.com", "192.168.1.10:18777"), false);
 
   const url = new URL("http://192.168.1.10:18777/playlist");
