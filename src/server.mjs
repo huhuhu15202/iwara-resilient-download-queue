@@ -7,7 +7,7 @@ import path from "node:path";
 import { CoverCache } from "./cover-cache.mjs";
 import { issueResourceTicket, verifyResourceTicket } from "./resource-ticket.mjs";
 
-const SERVICE_VERSION = "1.11.4";
+const SERVICE_VERSION = "1.11.5";
 
 function normalizeAddress(address = "") {
   const value = String(address || "").trim().toLowerCase();
@@ -23,6 +23,8 @@ function isPrivateAddress(address = "") {
   const value = normalizeAddress(address).replace(/^\[|\]$/g, "");
   if (isLoopbackAddress(value) || value === "0.0.0.0") return true;
   if (/^(10|192\.168|169\.254)\./.test(value)) return true;
+  const tailscaleOctet = /^100\.(\d{1,3})\./.exec(value)?.[1];
+  if (tailscaleOctet != null && Number(tailscaleOctet) >= 64 && Number(tailscaleOctet) <= 127) return true;
   if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(value)) return true;
   return value.startsWith("fe80:") || value.startsWith("fc") || value.startsWith("fd");
 }
