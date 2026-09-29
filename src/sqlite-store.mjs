@@ -309,9 +309,9 @@ export class SQLiteStore {
     const where = [];
     const params = [];
     if (query) {
-      where.push("(title LIKE ? ESCAPE '\\' OR author LIKE ? ESCAPE '\\' OR alias LIKE ? ESCAPE '\\' OR video_id LIKE ? ESCAPE '\\')");
+      where.push("(title LIKE ? ESCAPE '\\' OR author LIKE ? ESCAPE '\\' OR alias LIKE ? ESCAPE '\\' OR video_id LIKE ? ESCAPE '\\' OR data_json LIKE ? ESCAPE '\\')");
       const escaped = `%${query.replace(/[\\%_]/g, "\\$&")}%`;
-      params.push(escaped, escaped, escaped, escaped);
+      params.push(escaped, escaped, escaped, escaped, escaped);
     }
     if (state !== "all") {
       where.push("state=?");
@@ -351,9 +351,9 @@ export class SQLiteStore {
     const where = ["state='completed'", "media_status='present'", "COALESCE(json_extract(data_json, '$.destination'), '')<>''"];
     const params = [];
     if (query) {
-      where.push("(title LIKE ? ESCAPE '\\' OR author LIKE ? ESCAPE '\\' OR alias LIKE ? ESCAPE '\\' OR video_id LIKE ? ESCAPE '\\')");
+      where.push("(title LIKE ? ESCAPE '\\' OR author LIKE ? ESCAPE '\\' OR alias LIKE ? ESCAPE '\\' OR video_id LIKE ? ESCAPE '\\' OR data_json LIKE ? ESCAPE '\\')");
       const escaped = `%${String(query).replace(/[\\%_]/g, "\\$&")}%`;
-      params.push(escaped, escaped, escaped, escaped);
+      params.push(escaped, escaped, escaped, escaped, escaped);
     }
     if (author !== "all") { where.push("author=?"); params.push(author); }
     if (watched === "watched" || watched === "unwatched") {
@@ -422,6 +422,27 @@ export class SQLiteStore {
     offset = (safePage - 1) * safePageSize;
     const rows = this.db.prepare(`SELECT data_json FROM tasks ${clause} ORDER BY ${orderColumn} ${order}, id ${tieOrder} LIMIT ? OFFSET ?`).all(...params, safePageSize, offset);
     return { total, page: safePage, pageSize: safePageSize, currentIndex, globalIndex, hasPrevious: offset > 0, hasNext: offset + rows.length < total, tasks: rows.map(row => JSON.parse(row.data_json)) };
+  }
+
+  playlistTags({ limit = 18 } = {}) {
+    const rows = this.db.prepare("SELECT data_json FROM tasks WHERE state='completed' AND media_status='present' AND COALESCE(json_extract(data_json, '$.destination'), '')<>''").all();
+    const counts = new Map();
+    for (const row of rows) {
+      let data;
+      try { data = JSON.parse(row.data_json); } catch { continue; }
+      const seen = new Set();
+      for (const item of Array.isArray(data?.tags) ? data.tags : []) {
+        const value = typeof item === "string" ? item : (item?.name ?? item?.title ?? item?.label ?? item?.id ?? "");
+        const tag = String(value || "").trim();
+        if (!tag || seen.has(tag)) continue;
+        seen.add(tag);
+        counts.set(tag, (counts.get(tag) || 0) + 1);
+      }
+    }
+    return [...counts.entries()]
+      .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0], "zh-CN"))
+      .slice(0, Math.min(40, Math.max(1, Number(limit) || 18)))
+      .map(([tag, count]) => ({ tag, count }));
   }
 
   counts() {

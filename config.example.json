@@ -1,6 +1,6 @@
 {
   "dataRoot": "F:\\IwaraVideos\\R18\\ServiceData",
-  "downloadRoot": "F:\\Video",
+  "downloadRoot": "J:\\Video",
   "enginePath": "C:\\Program Files\\MotrixNext\\motrix-next-engine.exe",
   "serviceHost": "127.0.0.1",
   "lanAccessToken": "",
@@ -8,9 +8,16 @@
   "aria2Port": 16801,
   "maxAttempts": 6,
   "maxConcurrentTasks": 3,
+  "maxConcurrentMetadataTasks": 8,
+  "importedMetadataEnrichmentEnabled": false,
   "mediaReconcileIntervalMs": 300000,
   "mediaReconcileBatchSize": 50,
   "browserFallbackEnabled": true,
   "browserFallbackTimeoutMs": 45000,
-  "minValidMediaBytes": 65536
+  "minValidMediaBytes": 65536,
+  "remoteTranscodeEnabled": true,
+  "remoteTranscodeHeight": 480,
+  "remoteTranscodeConcurrency": 2,
+  "remoteTranscodeCacheMaxBytes": 21474836480,
+  "remoteTranscodeCacheMaxAgeMs": 86400000
 }

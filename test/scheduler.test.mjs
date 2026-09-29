@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { copyFile, mkdtemp, open, rename, rm, unlink, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, open, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, test } from "node:test";
@@ -319,6 +319,52 @@ describe("scheduler state transitions", () => {
     assert.equal(currentTask.metadataStatus, "enriching");
   });
 
+  test("download slots are independent from metadata slots", async () => {
+    const importedTask = task({ id: "imported", state: "completed", destination: "C:\\existing.mp4", imported: true, metadataStatus: "pending" });
+    const { current } = scheduler([importedTask], { maxConcurrentTasks: 1, maxConcurrentMetadataTasks: 1 });
+    const metadataLease = await current.leaseMetadataEnrichment();
+    assert.ok(metadataLease);
+    await current.enqueue([{ videoId: "new-video" }]);
+    const downloadLease = await current.leaseNext();
+    assert.ok(downloadLease, "an enriching metadata task must not consume the download slot");
+  });
+
+  test("legacy imported base metadata can be paused without blocking tags or downloads", async () => {
+    const importedTask = task({
+      id: "imported-base-only",
+      state: "completed",
+      destination: "C:\\existing.mp4",
+      imported: true,
+      author: "",
+      uploadTime: null,
+      metadataStatus: "pending"
+    });
+    const { current } = scheduler([importedTask], { importedMetadataEnrichmentEnabled: false });
+    assert.equal(await current.leaseMetadataEnrichment(), null);
+    const status = current.status();
+    assert.equal(status.importedMetadataEnrichmentEnabled, false);
+    assert.equal(status.metadataCounts.pending, 0);
+  });
+
+  test("init migrates legacy automatic imported tag requests without remote fetch", async () => {
+    const importedTask = task({
+      id: "legacy-imported-tags",
+      state: "completed",
+      destination: "C:\\missing.mp4",
+      imported: true,
+      tagsRequested: true,
+      metadataStatus: "failed",
+      metadataMessage: "Iwara 返回的数据缺少标签字段"
+    });
+    const { current } = scheduler([importedTask], { importedMetadataEnrichmentEnabled: false });
+    await current.init();
+    assert.equal(importedTask.tagsRequested, false);
+    assert.equal(importedTask.tagsRequestedExplicitly, false);
+    assert.equal(importedTask.metadataStatus, "complete");
+    assert.match(importedTask.metadataMessage, /未自动获取 Iwara 资料/);
+    assert.equal(await current.leaseMetadataEnrichment(), null);
+  });
+
   test("metadata success completes enrichment", async () => {
     const currentTask = task({ state: "completed", destination: "C:\\video.mp4", imported: true, metadataStatus: "pending" });
     const { current } = scheduler([currentTask]);
@@ -343,6 +389,76 @@ describe("scheduler state transitions", () => {
     await current.submitMetadataEnrichment({ taskId: currentTask.id, leaseId: lease.leaseId, ok: false, error: "视频不存在", permanent: true });
     assert.equal(currentTask.metadataStatus, "failed");
     assert.match(currentTask.metadataMessage, /保留原文件/);
+  });
+
+  test("refresh view counts queues existing and missing values", async () => {
+    const currentTasks = [
+      task({ id: "task-existing-view", state: "completed", destination: "C:\\existing.mp4", metadataStatus: "complete", viewCount: 123 }),
+      task({ id: "task-missing-view", state: "completed", destination: "C:\\missing.mp4", metadataStatus: "failed", viewCount: null }),
+      task({ id: "task-enriching", state: "completed", destination: "C:\\busy.mp4", metadataStatus: "enriching", viewCount: 456 })
+    ];
+    const { current } = scheduler(currentTasks);
+    const result = await current.refreshViewCountEnrichment();
+    assert.equal(result.queued, 2);
+    assert.equal(currentTasks[0].viewCountRequested, true);
+    assert.equal(currentTasks[0].metadataStatus, "pending");
+    assert.equal(currentTasks[1].metadataStatus, "pending");
+    assert.equal(currentTasks[2].metadataStatus, "enriching");
+  });
+
+  test("view-only metadata lease includes previously known view counts", async () => {
+    const currentTask = task({ state: "completed", destination: "C:\\video.mp4", metadataStatus: "pending", viewCountRequested: true, viewCount: 321 });
+    const { current } = scheduler([currentTask]);
+    const lease = await current.leaseMetadataEnrichment({ viewsOnly: true });
+    assert.equal(lease.videoId, currentTask.videoId);
+    assert.equal(currentTask.metadataStatus, "enriching");
+  });
+
+  test("refresh tags queues existing and missing values", async () => {
+    const currentTasks = [
+      task({ id: "task-existing-tag", state: "completed", destination: "C:\\existing.mp4", metadataStatus: "complete", tags: ["dance"], tagsUpdatedAt: "2026-01-01T00:00:00.000Z" }),
+      task({ id: "task-missing-tag", state: "completed", destination: "C:\\missing.mp4", metadataStatus: "failed", tagsRequested: true }),
+      task({ id: "task-enriching-tag", state: "completed", destination: "C:\\busy.mp4", metadataStatus: "enriching", tags: ["old"], tagsUpdatedAt: "2026-01-01T00:00:00.000Z" })
+    ];
+    const { current } = scheduler(currentTasks);
+    const result = await current.refreshTagEnrichment();
+    assert.equal(result.queued, 2);
+    assert.equal(currentTasks[0].tagsRequested, true);
+    assert.equal(currentTasks[0].metadataStatus, "pending");
+    assert.equal(currentTasks[1].metadataStatus, "pending");
+    assert.equal(currentTasks[2].metadataStatus, "enriching");
+  });
+
+  test("tag-only metadata lease and empty tag success are retained", async () => {
+    const currentTask = task({ state: "completed", destination: "C:\\video.mp4", metadataStatus: "pending", tagsRequested: true, tags: ["old"] });
+    const { current } = scheduler([currentTask]);
+    const lease = await current.leaseMetadataEnrichment({ tagsOnly: true });
+    assert.equal(lease.videoId, currentTask.videoId);
+    await current.submitMetadataEnrichment({
+      taskId: currentTask.id,
+      leaseId: lease.leaseId,
+      ok: true,
+      metadata: { title: "标题", author: "作者", uploadTime: "2026-01-01", tags: [] }
+    });
+    assert.deepEqual(currentTask.tags, []);
+    assert.equal(currentTask.tagsRequested, false);
+    assert.ok(currentTask.tagsUpdatedAt);
+    assert.equal(currentTask.metadataStatus, "complete");
+  });
+
+  test("tag enrichment accepts nested Iwara tag arrays and object ids", async () => {
+    const currentTask = task({ state: "completed", destination: "C:\\video.mp4", metadataStatus: "pending", tagsRequested: true });
+    const { current } = scheduler([currentTask]);
+    const lease = await current.leaseMetadataEnrichment({ tagsOnly: true });
+    await current.submitMetadataEnrichment({
+      taskId: currentTask.id,
+      leaseId: lease.leaseId,
+      ok: true,
+      metadata: { title: "标题", author: "作者", uploadTime: "2026-01-01", data: { tags: [{ id: "blender" }, { name: "mmd" }] } }
+    });
+    assert.deepEqual(currentTask.tags, ["blender", "mmd"]);
+    assert.ok(currentTask.tagsUpdatedAt);
+    assert.equal(currentTask.tagsRequested, false);
   });
 
   test("expired resolving lease is requeued by tick", async () => {
@@ -388,7 +504,7 @@ describe("scheduler state transitions", () => {
         backupRoot: path.join(root, "backups")
       });
       await sqlite.load();
-      const currentTask = task({ id: "cached-task", videoId: "cached-video", state: "completed", destination: media, fileStatus: "present", mediaCheckedAt: new Date().toISOString() });
+      const currentTask = task({ id: "cached-task", videoId: "cached-video", state: "completed", destination: media, fileStatus: "present", mediaCheckedAt: new Date().toISOString(), tags: ["dance"], tagsUpdatedAt: new Date().toISOString() });
       sqlite.state.tasks = [currentTask];
       await sqlite.save();
       const current = new Scheduler({
@@ -400,8 +516,11 @@ describe("scheduler state transitions", () => {
       const result = await current.playlist({ page: 1, pageSize: 30 });
       assert.equal(result.total, 1);
       assert.equal(result.items[0].id, "cached-task");
+      assert.ok(Array.isArray(result.authors));
       assert.equal(result.hasPrevious, false);
       assert.equal(result.hasNext, false);
+      const byTag = await current.playlist({ query: "dance", page: 1, pageSize: 30 });
+      assert.equal(byTag.total, 1);
       const context = await current.playlist({ contextIndex: 0, contextSize: 5 });
       assert.equal(context.globalIndex, 0);
       assert.equal(context.currentIndex, 0);
@@ -444,6 +563,27 @@ describe("scheduler state transitions", () => {
       assert.equal(tasks[0].fileStatus, "missing");
       assert.equal(tasks[1].fileStatus, "present");
       assert.equal(currentStore.saves, 1);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  test("media reconciliation finds a moved and renamed file by video ID", async () => {
+    const root = await tempRoot();
+    try {
+      const moved = path.join(root, "Video", "author-folder", "Sanitized title[video-index].mp4");
+      await mkdir(path.dirname(moved), { recursive: true });
+      await writeFile(moved, Buffer.concat([Buffer.from([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70]), Buffer.alloc(2048)]));
+      const currentTask = task({
+        id: "moved-task",
+        videoId: "video-index",
+        state: "completed",
+        destination: path.join("D:\\Documents\\Downloads\\Video", "Original title[video-index].mp4"),
+        fileStatus: "missing"
+      });
+      const { current } = scheduler([currentTask], { root, downloadRoot: path.join(root, "Video") });
+      await current.verifyCompletedTask(currentTask);
+      assert.equal(currentTask.fileStatus, "present");
+      assert.equal(currentTask.destination, moved);
+      assert.ok(currentTask.pathReconciledAt);
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 

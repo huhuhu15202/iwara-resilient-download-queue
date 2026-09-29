@@ -7,7 +7,7 @@ import path from "node:path";
 import { CoverCache } from "./cover-cache.mjs";
 import { issueResourceTicket, verifyResourceTicket } from "./resource-ticket.mjs";
 
-const SERVICE_VERSION = "1.11.5";
+const SERVICE_VERSION = "1.15.0";
 
 function normalizeAddress(address = "") {
   const value = String(address || "").trim().toLowerCase();
@@ -79,20 +79,52 @@ export function authorizeRequest(request, url, accessToken = "") {
   return { ok: tokenMatches(token, candidate), viaQuery: Boolean(queryToken && tokenMatches(token, queryToken)) };
 }
 
-function withResourceUrls(payload, accessToken) {
+function normalizePlaybackProfile(value = "") {
+  return String(value || "").toLowerCase() === "remote" ? "remote" : "local";
+}
+
+function withResourceUrls(payload, accessToken, profile = "local") {
   const token = String(accessToken || "").trim();
+  const playbackProfile = normalizePlaybackProfile(profile);
   return {
     ...payload,
+    playbackProfile,
     items: (payload.items || []).map(item => {
       const mediaTicket = issueResourceTicket(token, "media", item.id);
       const coverTicket = issueResourceTicket(token, "cover", item.id);
+      const mediaQuery = new URLSearchParams();
+      if (mediaTicket) mediaQuery.set("ticket", mediaTicket);
+      // Keep the selected mode explicit on the media request.  This matters
+      // for a Tailscale client: without profile=local, the server correctly
+      // auto-detects the host as remote and would silently switch back to 480p.
+      mediaQuery.set("profile", playbackProfile);
+      const downloadQuery = new URLSearchParams(mediaQuery);
+      downloadQuery.set("download", "1");
+      const coverQuery = coverTicket ? `?ticket=${encodeURIComponent(coverTicket)}` : "";
       return {
         ...item,
-        streamUrl: `/media/${encodeURIComponent(item.id)}${mediaTicket ? `?ticket=${mediaTicket}` : ""}`,
-        coverUrl: `/cover/${encodeURIComponent(item.id)}${coverTicket ? `?ticket=${coverTicket}` : ""}`
+        playbackProfile,
+        streamUrl: `/media/${encodeURIComponent(item.id)}${mediaQuery.toString() ? `?${mediaQuery}` : ""}`,
+        downloadUrl: `/media/${encodeURIComponent(item.id)}?${downloadQuery}`,
+        coverUrl: `/cover/${encodeURIComponent(item.id)}${coverQuery}`
       };
     })
   };
+}
+
+function isTailscaleAddress(address = "") {
+  const value = normalizeAddress(address);
+  const match = /^100\.(\d{1,3})\./.exec(value);
+  return Boolean(match && Number(match[1]) >= 64 && Number(match[1]) <= 127);
+}
+
+function requestPlaybackProfile(request, url) {
+  const explicit = url?.searchParams?.get("profile");
+  if (explicit) return normalizePlaybackProfile(explicit);
+  // A Tailscale URL is the remote entry point even when the user opens the
+  // plain /playlist link from an older bookmark. LAN 192.168.x links keep the
+  // original file, while Cloudflare/FRP callers can opt in with profile=remote.
+  return isTailscaleAddress(requestHostName(request?.headers?.host || "")) ? "remote" : "local";
 }
 
 function localLanAddresses() {
@@ -154,15 +186,16 @@ th:nth-child(1){width:82px}th:nth-child(2){width:310px}th:nth-child(3){width:180
 .title b{display:block;color:#203957;font-size:14px}.muted{color:#7a899d;font-size:12px;margin-top:3px}
 td.completed{color:#25835a;font-weight:700}td.failed{color:#c74444;font-weight:700}td.downloading{color:#246ec2;font-weight:700}td.queued,td.resolving,td.finalizing{color:#a66b06;font-weight:700}
 .present{color:#25835a}.missing,.size_mismatch{color:#c74444}.progress{height:8px;background:#e7eef7;border-radius:8px;overflow:hidden;margin-top:8px}.progress i{display:block;height:100%;background:linear-gradient(90deg,#5b8def,#6bb7ee)}
-.actions{display:flex;gap:6px;flex-wrap:wrap}.actions a{text-decoration:none}.actions button{padding:6px 9px;min-height:32px;font-size:12px}.lan-links{display:inline-flex;gap:6px;flex-wrap:wrap;vertical-align:middle;margin-left:6px}.lan-links button{padding:5px 9px;min-height:30px;font-size:12px}.lan-links a{padding:5px 9px;border:1px solid #cbd7e6;border-radius:9px;background:#fff;color:#33445c;text-decoration:none;font-size:12px;font-weight:600}.lan-links a:hover{border-color:#5b8def;background:#eef5ff}
+.actions{display:flex;gap:6px;flex-wrap:wrap}.actions a{text-decoration:none}.actions button{padding:6px 9px;min-height:32px;font-size:12px}.quick-actions{display:inline-flex;gap:7px;align-items:center;flex-wrap:wrap;vertical-align:middle;margin-left:6px}.quick-actions a{text-decoration:none}.lan-links{display:inline-flex;gap:6px;flex-wrap:wrap;vertical-align:middle;margin-left:6px}.lan-links button{padding:5px 9px;min-height:30px;font-size:12px}.lan-links a{padding:5px 9px;border:1px solid #cbd7e6;border-radius:9px;background:#fff;color:#33445c;text-decoration:none;font-size:12px;font-weight:600}.lan-links a:hover{border-color:#5b8def;background:#eef5ff}
 .pager{display:flex;justify-content:space-between;gap:14px;align-items:center;margin-top:14px;background:#fff;border:1px solid #dfe7f1;border-radius:12px;padding:12px 14px}.pager>span:last-child{display:flex;gap:7px;flex-wrap:wrap}.empty{text-align:center;color:#7a899d;padding:34px}
 .modal-backdrop{position:fixed;inset:0;z-index:20;background:rgba(35,50,71,.35);display:none;align-items:center;justify-content:center;padding:18px}.modal-backdrop.open{display:flex}.modal{width:min(980px,100%);max-height:90vh;overflow:auto;background:#f8fbff;border-radius:18px;padding:20px;box-shadow:0 24px 70px rgba(29,52,84,.3)}.modal h2{margin:0 0 5px;color:#17365f}.modal-tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:14px 0}.modal-tools input{min-width:240px;flex:1}.author-grid{display:grid;gap:8px}.author-row{display:grid;grid-template-columns:32px minmax(190px,1fr) 110px 125px minmax(210px,1.2fr);gap:9px;align-items:center;background:#fff;border:1px solid #dfe7f1;border-radius:11px;padding:9px 11px}.author-row input[type=checkbox]{min-height:auto;width:18px;height:18px}.author-row input[type=text]{width:100%}.modal-actions{position:sticky;bottom:-20px;display:flex;justify-content:flex-end;gap:8px;background:#f8fbff;padding:14px 0 0}.preview{white-space:pre-wrap;background:#eef5ff;border-radius:10px;padding:11px 13px;color:#36516f;margin-top:12px}
+.control-panel-backdrop{position:fixed;inset:0;z-index:15;background:rgba(35,50,71,.22);display:none;align-items:flex-start;justify-content:flex-end;padding:18px}.control-panel-backdrop.open{display:flex}.control-panel{width:min(520px,calc(100vw - 28px));max-height:calc(100vh - 36px);overflow:auto;background:#f8fbff;border:1px solid #d8e5f2;border-radius:18px;padding:20px;box-shadow:0 24px 70px rgba(29,52,84,.3)}.control-panel h2{margin:0;color:#17365f}.control-panel p{margin:5px 0 14px;color:#63738a}.control-panel-tools{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.control-panel-tools button,.control-panel-tools a{width:100%}.control-panel-tools a button{width:100%}.control-panel-foot{display:flex;justify-content:flex-end;margin-top:14px}.control-panel .lan-links{display:flex;margin:12px 0 0}
 @media(max-width:900px){main{padding:14px}.filters{grid-template-columns:1fr 1fr}.filters input{grid-column:1/-1}.pager{align-items:flex-start;flex-direction:column}h1{font-size:23px}}
 @media(max-width:700px){.author-row{grid-template-columns:28px 1fr}.author-row>*:nth-child(n+3){grid-column:2}.filters{grid-template-columns:1fr}.cards{grid-template-columns:1fr 1fr}}
-</style><main><h1>Iwara 稳定下载台账</h1><p class="hint">成功与失败记录都会永久保留；同一视频 ID 不会重复下载。 <button onclick="openDownloadDirectory()">打开视频目录</button> <a href="/playlist" target="_blank"><button>打开本地播放列表</button></a> <button onclick="showLanAccess()">显示局域网播放链接</button> <a href="/IwaraResilientQueue.user.js"><button>安装 / 更新网页脚本</button></a> <span id="lanInfo"></span></p>
+</style><main><h1>Iwara 稳定下载台账</h1><p class="hint">成功与失败记录都会永久保留；同一视频 ID 不会重复下载。 <button onclick="openControlPanel()">控制面板</button> <span class="quick-actions"><button onclick="openDownloadDirectory()">打开视频目录</button> <a href="/playlist" target="_blank" rel="noopener"><button>打开本地播放列表</button></a> <button onclick="showLanAccess()">显示局域网播放链接</button></span></p>
 <div class="cards" id="cards"></div><div id="current"></div><div id="metadataProgress"></div>
 <div class="filters">
-  <input id="query" placeholder="搜索标题、作者或视频 ID">
+  <input id="query" placeholder="搜索标题、作者、标签或视频 ID">
   <select id="stateFilter"><option value="all">全部状态</option></select>
   <select id="authorFilter"><option value="all">全部作者</option></select>
   <select id="sortBy">
@@ -173,7 +206,24 @@ td.completed{color:#25835a;font-weight:700}td.failed{color:#c74444;font-weight:7
   <select id="direction"><option value="desc">降序</option><option value="asc">升序</option></select>
 </div>
 <div class="table-wrap"><table><thead><tr><th>状态</th><th>标题 / 视频 ID</th><th>作者</th><th>上传日期</th><th>记录日期</th><th>文件</th><th>尝试</th><th>说明</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table></div>
-<div class="pager"><span id="summary"></span><span><button id="previous">上一页</button> <button id="next">下一页</button> <button onclick="openAuthorClassification()">按作者整理视频</button> <button onclick="queueViews()">同步缺失播放量</button> <button onclick="retryMetadata()">重试补齐失败项</button> <button onclick="verifyFiles()">检查文件</button> <button onclick="shutdown()">停止服务</button></span></div>
+<div class="pager"><span id="summary"></span><span><button id="previous">上一页</button> <button id="next">下一页</button></span></div>
+<div id="controlPanel" class="control-panel-backdrop" onclick="if(event.target===this)closeControlPanel()"><section class="control-panel">
+  <h2>控制面板</h2>
+  <p>常用管理、补齐和服务操作集中在这里；列表主界面仅保留筛选与翻页。</p>
+  <div class="control-panel-tools">
+    <a href="/IwaraResilientQueue.user.js"><button>安装 / 更新网页脚本</button></a>
+    <button onclick="openAuthorClassification()">按作者整理视频</button>
+    <button onclick="queueViews()">同步缺失播放量</button>
+    <button onclick="refreshAllViews()">更新全部播放量</button>
+    <button onclick="queueTags()">同步缺失标签</button>
+    <button onclick="refreshAllTags()">更新全部标签</button>
+    <button onclick="retryMetadata()">重试补齐失败项</button>
+    <button onclick="verifyFiles()">检查文件</button>
+    <button onclick="shutdown()">停止服务</button>
+  </div>
+  <span id="lanInfo"></span>
+  <div class="control-panel-foot"><button onclick="closeControlPanel()">关闭控制面板</button></div>
+</section></div>
 <div id="authorModal" class="modal-backdrop" onclick="if(event.target===this)closeAuthorClassification()"><section class="modal">
   <h2>按作者整理已下载视频</h2>
   <div class="hint">只显示已完成视频超过 10 个的作者。勾选作者并填写分类目录；多个作者使用相同目录名，就会合并到同一个目录。先预览，确认后才移动当前根目录中的视频；以后新下载也自动归类。</div>
@@ -189,22 +239,27 @@ const fileNames={present:'正常',missing:'文件缺失',size_mismatch:'大小�
 const errorNames={tls_certificate:'CDN 证书或主机名不匹配',tls_handshake:'TLS 握手失败',source_exhausted:'可用 CDN 均已尝试',not_found:'视频源不存在',access_or_expired:'地址过期或拒绝访问',timeout:'下载超时',network:'网络连接失败',permission:'权限不足',source_unavailable:'没有可用视频源',unknown:'其他错误'};
 let summaryData={counts:{},metadataCounts:{},currents:[],metadataCurrents:[],current:null,total:0},ledger={tasks:[],authors:[],total:0,page:1,pageSize:50},page=1,loading=false,pendingLoad=false,inputTimer,authorCandidates=[],classificationPreview=null;const pageSize=50;
 const el=id=>document.getElementById(id);
+function openControlPanel(){el('controlPanel').classList.add('open')}
+function closeControlPanel(){el('controlPanel').classList.remove('open')}
 const dateText=value=>{if(!value)return '—';const d=new Date(value);return Number.isNaN(d.getTime())?'—':d.toLocaleString('zh-CN',{hour12:false})};
 const authorText=t=>t.alias?(t.alias+(t.author&&t.author!==t.alias?' (@'+t.author+')':'')):(t.author||'—');
 const bytes=value=>{const n=Number(value||0);if(!n)return '—';const units=['B','KiB','MiB','GiB'];let i=0,v=n;while(v>=1024&&i<units.length-1){v/=1024;i++}return v.toFixed(i?1:0)+' '+units[i]};
 const progressText=t=>{const done=Number(t.completedLength||0),total=Number(t.totalLength||0),speed=Number(t.downloadSpeed||0),pct=total?Math.min(100,done/total*100):0,eta=speed&&total>done?Math.ceil((total-done)/speed):0;return{pct,text:bytes(done)+' / '+bytes(total)+(speed?' · '+bytes(speed)+'/s':'')+(eta?' · 约 '+eta+' 秒':'')}};
 async function retry(id){await fetch('/api/retry/'+id,{method:'POST'});await load()}
 async function redownload(id){if(confirm('记录对应的文件缺失，确定重新下载？')){await fetch('/api/redownload/'+id,{method:'POST'});await load()}}
-async function verifyFiles(){const r=await(await fetch('/api/verify-files',{method:'POST'})).json();alert('检查完成：正常 '+r.present+'，缺失 '+r.missing+'，大小异常 '+r.sizeMismatch);await load()}
-async function openDownloadDirectory(){const r=await fetch('/api/open-download-directory',{method:'POST'});if(!r.ok){const body=await r.json();alert('打开目录失败：'+(body.error||r.status))}}
-async function showLanAccess(){const target=el('lanInfo');target.className='lan-links';target.replaceChildren();try{const r=await fetch('/api/lan-info',{cache:'no-store'});const data=await r.json();if(!r.ok)throw Error(data.error||r.status);if(!data.enabled){target.textContent='局域网未开启（将 serviceHost 改为 0.0.0.0 后重启）';return}const urls=data.urls||[];if(!urls.length){target.textContent='未发现局域网 IPv4 地址，请查看服务日志';return}urls.forEach((url,index)=>{let label='局域网 '+(index+1);try{label=new URL(url).host}catch{}const copy=document.createElement('button');copy.type='button';copy.title='点击复制完整播放地址';copy.textContent=label;copy.onclick=async()=>{try{if(navigator.clipboard?.writeText)await navigator.clipboard.writeText(url);else{const area=document.createElement('textarea');area.value=url;area.style.position='fixed';area.style.opacity='0';document.body.append(area);area.focus();area.select();if(!document.execCommand('copy'))throw Error('copy failed');area.remove()}copy.textContent='已复制';setTimeout(()=>copy.textContent=label,1600)}catch{copy.textContent='复制失败';setTimeout(()=>copy.textContent=label,1600)}};const open=document.createElement('a');open.href=url;open.target='_blank';open.rel='noopener';open.textContent='打开';target.append(copy,open)})}catch(e){target.textContent='读取局域网链接失败：'+e.message}}
-async function retryMetadata(){const r=await(await fetch('/api/enrich/retry-failed',{method:'POST'})).json();alert('已将 '+r.count+' 条补齐失败记录放回队列');await load()}
-async function queueViews(){const r=await(await fetch('/api/enrich/queue-views',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})})).json();alert('已加入 '+r.queued+' 条播放量同步任务'+(r.remaining?'，尚有 '+r.remaining+' 条待加入':'')+'。保持任一 Iwara 视频页打开，网页脚本会以最多 3 个并发逐步处理。');await load()}
+async function verifyFiles(){closeControlPanel();const r=await(await fetch('/api/verify-files',{method:'POST'})).json();alert('检查完成：正常 '+r.present+'，缺失 '+r.missing+'，大小异常 '+r.sizeMismatch);await load()}
+async function openDownloadDirectory(){closeControlPanel();const r=await fetch('/api/open-download-directory',{method:'POST'});if(!r.ok){const body=await r.json();alert('打开目录失败：'+(body.error||r.status))}}
+async function showLanAccess(){closeControlPanel();const target=el('lanInfo');target.className='lan-links';target.replaceChildren();try{const r=await fetch('/api/lan-info',{cache:'no-store'});const data=await r.json();if(!r.ok)throw Error(data.error||r.status);if(!data.enabled){target.textContent='局域网未开启（将 serviceHost 改为 0.0.0.0 后重启）';openControlPanel();return}const entries=[...(data.urls||[]).map((url,index)=>({url,label:'局域网 '+(index+1)})),...(data.remoteUrls||[]).map((url,index)=>({url,label:'远程480p '+(index+1)}))];if(!entries.length){target.textContent='未发现局域网 IPv4 地址，请查看服务日志';openControlPanel();return}entries.forEach(({url,label})=>{try{label=new URL(url).host+(new URL(url).searchParams.get('profile')==='remote'?' · 远程480p':'')}catch{}const copy=document.createElement('button');copy.type='button';copy.title='点击复制完整播放地址';copy.textContent=label;copy.onclick=async()=>{try{if(navigator.clipboard?.writeText)await navigator.clipboard.writeText(url);else{const area=document.createElement('textarea');area.value=url;area.style.position='fixed';area.style.opacity='0';document.body.append(area);area.focus();area.select();if(!document.execCommand('copy'))throw Error('copy failed');area.remove()}copy.textContent='已复制';setTimeout(()=>copy.textContent=label,1600)}catch{copy.textContent='复制失败';setTimeout(()=>copy.textContent=label,1600)}};const open=document.createElement('a');open.href=url;open.target='_blank';open.rel='noopener';open.textContent='打开';target.append(copy,open)});openControlPanel()}catch(e){target.textContent='读取局域网链接失败：'+e.message;openControlPanel()}}
+async function retryMetadata(){closeControlPanel();const r=await(await fetch('/api/enrich/retry-failed',{method:'POST'})).json();alert('已将 '+r.count+' 条补齐失败记录放回队列');await load()}
+async function queueViews(){closeControlPanel();const r=await(await fetch('/api/enrich/queue-views',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})})).json();alert('已加入 '+r.queued+' 条播放量同步任务'+(r.remaining?'，尚有 '+r.remaining+' 条待加入':'')+'。保持任一 Iwara 视频页打开，网页脚本会以最多 8 个并发逐步处理。');await load()}
+async function refreshAllViews(){closeControlPanel();if(!confirm('将重新读取所有已下载视频的播放量，保持任一 Iwara 视频页打开即可处理。确认继续？'))return;const r=await(await fetch('/api/enrich/refresh-views',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})})).json();alert('已加入 '+r.queued+' 条全部播放量更新任务'+(r.remaining?'，尚有 '+r.remaining+' 条待加入':'')+'。网页脚本将使用独立的 8 并发播放量队列。');await load()}
+async function queueTags(){closeControlPanel();const r=await(await fetch('/api/enrich/queue-tags',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})})).json();alert('已加入 '+r.queued+' 条标签同步任务'+(r.remaining?'，尚有 '+r.remaining+' 条待加入':'')+'。保持任一 Iwara 视频页打开即可逐步处理。');await load()}
+async function refreshAllTags(){closeControlPanel();if(!confirm('将重新读取所有已下载视频的标签，保持任一 Iwara 视频页打开即可处理。确认继续？'))return;const r=await(await fetch('/api/enrich/refresh-tags',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})})).json();alert('已加入 '+r.queued+' 条全部标签更新任务'+(r.remaining?'，尚有 '+r.remaining+' 条待加入':'')+'。网页脚本将使用独立的元数据队列。');await load()}
 async function history(id){const list=await(await fetch('/api/attempts/'+id)).json();alert(list.length?list.map(x=>dateText(x.createdAt)+' · 第'+x.attemptNo+'次 · '+x.phase+' · '+x.outcome+(x.sourceHost?' · '+x.sourceHost:'')+(x.message?'\\n'+x.message:'')).join('\\n\\n'):'尚无尝试明细')}
-async function shutdown(){if(confirm('停止稳定下载服务？当前任务下次启动时会重新解析。')){await fetch('/api/shutdown',{method:'POST'});document.body.innerHTML='<main><h1>服务已停止</h1><p>需要下载时重新双击启动文件即可。</p></main>'}}
+async function shutdown(){closeControlPanel();if(confirm('停止稳定下载服务？当前任务下次启动时会重新解析。')){await fetch('/api/shutdown',{method:'POST'});document.body.innerHTML='<main><h1>服务已停止</h1><p>需要下载时重新双击启动文件即可。</p></main>'}}
 function selectedAuthorRules(){return [...document.querySelectorAll('.author-choice:checked')].map(box=>({author:box.dataset.author,folder:document.querySelector('.author-folder[data-author="'+CSS.escape(box.dataset.author)+'"]').value.trim()}))}
 function invalidateClassificationPreview(){classificationPreview=null;el('applyClassification').disabled=true;el('classificationPreview').textContent='选择已更改，请重新预览。'}
-async function openAuthorClassification(){const r=await fetch('/api/author-categories?minCount=10');const data=await r.json();if(!r.ok){alert(data.error||r.status);return}authorCandidates=data.candidates||[];el('authorRows').innerHTML=authorCandidates.length?authorCandidates.map(a=>'<label class="author-row"><input class="author-choice" type="checkbox" data-author="'+esc(a.author)+'" '+(a.category?'checked':'')+' onchange="invalidateClassificationPreview()"><span><b>'+esc(a.alias||a.author)+'</b><div class="muted">@'+esc(a.author)+'</div></span><span>已完成 '+a.completedCount+'</span><span>未分类 '+a.unclassifiedCount+'</span><input class="author-folder" type="text" data-author="'+esc(a.author)+'" value="'+esc(a.category||a.alias||a.author)+'" oninput="invalidateClassificationPreview()" aria-label="分类目录"></label>').join(''):'<div class="empty">目前没有超过 10 个已完成视频的作者</div>';el('classificationPreview').textContent='尚未预览。';el('applyClassification').disabled=true;el('authorModal').classList.add('open')}
+async function openAuthorClassification(){closeControlPanel();const r=await fetch('/api/author-categories?minCount=10');const data=await r.json();if(!r.ok){alert(data.error||r.status);return}authorCandidates=data.candidates||[];el('authorRows').innerHTML=authorCandidates.length?authorCandidates.map(a=>'<label class="author-row"><input class="author-choice" type="checkbox" data-author="'+esc(a.author)+'" '+(a.category?'checked':'')+' onchange="invalidateClassificationPreview()"><span><b>'+esc(a.alias||a.author)+'</b><div class="muted">@'+esc(a.author)+'</div></span><span>已完成 '+a.completedCount+'</span><span>未分类 '+a.unclassifiedCount+'</span><input class="author-folder" type="text" data-author="'+esc(a.author)+'" value="'+esc(a.category||a.alias||a.author)+'" oninput="invalidateClassificationPreview()" aria-label="分类目录"></label>').join(''):'<div class="empty">目前没有超过 10 个已完成视频的作者</div>';el('classificationPreview').textContent='尚未预览。';el('applyClassification').disabled=true;el('authorModal').classList.add('open')}
 function closeAuthorClassification(){el('authorModal').classList.remove('open')}
 function toggleAllAuthors(checked){document.querySelectorAll('.author-choice').forEach(box=>box.checked=checked);invalidateClassificationPreview()}
 function setMergedFolder(){const folder=el('mergeFolder').value.trim();if(!folder){alert('请先填写合并后的分类目录名');return}document.querySelectorAll('.author-choice:checked').forEach(box=>{document.querySelector('.author-folder[data-author="'+CSS.escape(box.dataset.author)+'"]').value=folder});invalidateClassificationPreview()}
@@ -216,9 +271,10 @@ function render(){
     Object.entries(summaryData.counts).map(([k,v])=>'<button class="card '+(el('stateFilter').value===k?'active':'')+'" onclick="setState(\\''+k+'\\')"><b>'+v+'</b>'+esc(stateNames[k]||k)+'</button>').join('');
   const currents=summaryData.currents||[];
   el('current').innerHTML=currents.map((t,index)=>{const p=progressText(t);return '<div class="current">活动任务 '+(index+1)+' / '+summaryData.maxConcurrentTasks+'：<b>'+esc(t.title||t.videoId)+'</b> · '+esc(t.message)+'<div class="muted">'+esc(p.text)+'</div><div class="progress"><i style="width:'+p.pct+'%"></i></div></div>'}).join('');
-  const m=summaryData.metadataCounts||{},v=summaryData.viewCounts||{},remaining=Number(m.pending||0)+Number(m.retry||0)+Number(m.enriching||0);
+  const m=summaryData.metadataCounts||{},v=summaryData.viewCounts||{},g=summaryData.tagCounts||{},remaining=Number(m.pending||0)+Number(m.retry||0)+Number(m.enriching||0),baseEnrichmentEnabled=summaryData.importedMetadataEnrichmentEnabled!==false;
   const metadataNow=(summaryData.metadataCurrents||[]).map(t=>t.videoId).join('、');
-  el('metadataProgress').innerHTML=(remaining||m.failed||v.missing)?'<div class="current">已有文件元数据：已补齐 <b>'+Number(m.complete||0)+'</b> · 待处理 '+remaining+' · 失败 '+Number(m.failed||0)+(metadataNow?' · 当前 '+esc(metadataNow):'')+'<br>播放量：已同步 <b>'+Number(v.complete||0)+'</b> · 缺失 '+Number(v.missing||0)+' · 排队 '+Number(v.pending||0)+' · 同步失败 '+Number(v.failed||0)+'<div class="muted">下载和补齐合计最多 '+summaryData.maxConcurrentTasks+' 个活动任务；正常下载优先使用空位。</div></div>':'';
+  const baseLine=baseEnrichmentEnabled?'已有文件基础资料：已补齐 <b>'+Number(m.complete||0)+'</b> · 待处理 '+remaining+' · 失败 '+Number(m.failed||0)+(metadataNow?' · 当前 '+esc(metadataNow):'')+'<br>':'已有文件基础资料：已暂停，不再占用下载队列<br>';
+  el('metadataProgress').innerHTML=(remaining||m.failed||v.missing||g.missing||!baseEnrichmentEnabled)?'<div class="current">'+baseLine+'播放量：已同步 <b>'+Number(v.complete||0)+'</b> · 缺失 '+Number(v.missing||0)+' · 排队 '+Number(v.pending||0)+' · 同步失败 '+Number(v.failed||0)+'<br>标签：已同步 <b>'+Number(g.complete||0)+'</b> · 缺失 '+Number(g.missing||0)+' · 排队 '+Number(g.pending||0)+' · 同步失败 '+Number(g.failed||0)+'<div class="muted">下载最多 '+summaryData.maxConcurrentDownloads+' 个；资料补齐最多 '+summaryData.maxConcurrentMetadataTasks+' 个，二者互不占用。</div></div>':'';
   const pages=Math.max(1,Math.ceil(ledger.total/pageSize));page=Math.min(page,pages);
   el('rows').innerHTML=ledger.tasks.length?ledger.tasks.map(t=>'<tr><td class="'+esc(t.state)+'">'+esc(stateNames[t.state]||t.state)+'</td>'+
     '<td class="title"><b>'+esc(t.title||'标题尚未取得')+'</b><div class="muted">'+esc(t.videoId)+'</div></td>'+
@@ -229,7 +285,7 @@ function render(){
     (t.sourcePage?'<a href="'+esc(t.sourcePage)+'" target="_blank"><button>打开原网页</button></a> ':'')+
     (t.state==='failed'?'<button onclick="retry(\\''+t.id+'\\')">重试</button>':'')+
     (t.state==='completed'&&t.fileStatus&&t.fileStatus!=='present'?'<button onclick="redownload(\\''+t.id+'\\')">重新下载</button>':'')+'</div></td></tr>').join(''):
-    '<tr><td colspan="9" class="empty">没有符合条件的记录</td></tr>';
+    '<tr><td colspan="10" class="empty">没有符合条件的记录</td></tr>';
   el('summary').textContent='共 '+ledger.total+' 条 · 第 '+page+' / '+pages+' 页';
   el('previous').disabled=page<=1;el('next').disabled=page>=pages;
 }
@@ -250,29 +306,63 @@ function playlistHtml() {
   return `<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="idm-disable" content="true">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Iwara 本地播放列表</title>
 <style>
-*{box-sizing:border-box}body{margin:0;background:#f2f6fb;color:#26374d;font:14px/1.5 "Segoe UI","Microsoft YaHei",system-ui}header{position:sticky;top:0;z-index:5;background:rgba(255,255,255,.96);border-bottom:1px solid #dce6f1;padding:14px 24px;display:flex;gap:16px;align-items:center;flex-wrap:wrap}header h1{font-size:21px;color:#17365f;margin:0 12px 0 0}header input{width:min(420px,60vw)}input,select,button{font:inherit;border:1px solid #cad8e8;border-radius:9px;background:#fff;color:#30445e;padding:9px 11px;min-height:38px}button{cursor:pointer;font-weight:600}button:hover{border-color:#5b8def;background:#eef5ff}.layout{max-width:1600px;margin:0 auto;padding:22px;display:grid;grid-template-columns:minmax(0,1fr) 390px;gap:20px}.layout.focus-player{grid-template-columns:minmax(0,1fr)}.layout.focus-player>section{display:none}.layout.focus-player .player{position:relative;top:0;width:min(1120px,100%);margin:0 auto;padding:18px}.layout.focus-player .player video{max-height:calc(100vh - 220px);object-fit:contain}.layout.focus-player .upnext{max-height:300px;overflow:auto}.toolbar{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-bottom:16px}.toolbar .count{margin-left:auto;color:#71829a}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:15px}.card{background:#fff;border:1px solid #d9e4f0;border-radius:13px;overflow:hidden;cursor:pointer;box-shadow:0 4px 15px rgba(52,85,123,.07);transition:.15s}.card:hover,.card.active{border-color:#5b8def;transform:translateY(-2px);box-shadow:0 8px 22px rgba(49,101,185,.16)}.thumb{aspect-ratio:16/9;background:#dce8f4;position:relative;overflow:hidden}.thumb video{width:100%;height:100%;object-fit:cover;display:block}.badge{position:absolute;right:8px;bottom:7px;background:rgba(20,45,75,.75);color:#fff;padding:2px 6px;border-radius:5px;font-size:11px}.watch-badge{position:absolute;left:8px;bottom:7px;background:rgba(34,116,84,.86);color:#fff;padding:2px 6px;border-radius:5px;font-size:11px}.watch-badge.unwatched{background:rgba(72,92,120,.86)}.card-body{padding:10px 11px}.card-title{font-weight:700;color:#203957;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.meta{color:#72839a;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:4px}.card-progress{height:4px;background:#e4edf7;border-radius:4px;overflow:hidden;margin-top:7px}.card-progress i{display:block;height:100%;background:#5b8def}.empty{padding:50px;text-align:center;color:#7a899d;background:#fff;border:1px dashed #cbd8e6;border-radius:14px}.player{position:sticky;top:82px;background:#fff;border:1px solid #d9e4f0;border-radius:15px;padding:13px;box-shadow:0 5px 20px rgba(52,85,123,.1);height:max-content}.player video{display:block;width:100%;aspect-ratio:16/9;background:#dce8f4;border-radius:10px}.player h2{font-size:18px;line-height:1.35;margin:13px 0 6px;color:#17365f}.player-meta{color:#657890;display:flex;flex-wrap:wrap;gap:7px 13px}.player-actions{display:flex;gap:7px;margin-top:12px;flex-wrap:wrap}.player-state{margin-top:10px;padding:8px 10px;background:#f2f7ff;border-radius:8px;color:#536985}.player-error{margin-top:10px;padding:9px 10px;background:#fff3f1;border:1px solid #f0c4bd;border-radius:8px;color:#ad3f31;white-space:pre-wrap}.upnext{border-top:1px solid #e6edf5;margin-top:15px;padding-top:12px}.upnext h3{margin:0 0 9px;font-size:14px;color:#36516f}.next-row{display:flex;gap:9px;padding:7px 4px;border-radius:8px;cursor:pointer}.next-row:hover{background:#eef5ff}.next-row video{width:92px;height:52px;aspect-ratio:auto;border-radius:5px;object-fit:cover}.next-row b{display:block;font-size:12px;line-height:1.35;max-height:34px;overflow:hidden}.next-row span{display:block;color:#7a899d;font-size:11px}.status{margin:10px 0;color:#71829a;font-size:12px;min-height:18px}.load-sentinel{height:1px;width:100%;pointer-events:none}.load-sentinel[hidden]{display:none}[id*="idm" i],[class*="idm" i],[id*="internet-download-manager" i],[class*="internet-download-manager" i]{display:none!important}@media(max-width:1050px){.layout{grid-template-columns:1fr}.player{position:relative;top:0;grid-row:1}.grid{grid-template-columns:repeat(auto-fill,minmax(190px,1fr))}}@media(max-width:600px){header{position:relative;top:auto;z-index:auto;padding:12px 14px}.layout{padding:14px}.grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.card-body{padding:8px}.player{padding:9px}}</style>
- <style>.single-mode header{justify-content:flex-start}.single-mode header input,.single-mode header select,.single-mode header #randomPage,.single-mode header #queueViews,.single-mode header #scriptLink{display:none}.single-mode .layout{padding-top:14px}.single-mode .player{box-shadow:0 8px 28px rgba(52,85,123,.12)}body:not(.single-mode) #layout>.player,body:not(.single-mode) #toggleView{display:none}body:not(.single-mode) .layout{display:block}.next-row.compact-row{align-items:center;border:1px solid #e6edf5;margin:4px 0;padding:8px 10px}.next-row.compact-row .compact-index{min-width:30px;color:#71829a;font-size:12px}.thumb .cover-image{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;z-index:1}.thumb .cover-fallback{position:absolute;inset:0;display:grid;place-items:center;color:#637a96;font-size:12px}.thumb .cover-fallback[hidden]{display:none}.thumb .badge,.thumb .watch-badge{z-index:2}</style>
-<header><h1>Iwara 本地播放列表</h1><input id="query" placeholder="搜索标题、作者或视频 ID"><select id="sort"><option value="updatedAt">最近下载</option><option value="title">标题</option><option value="author">作者</option><option value="uploadTime">上传日期</option><option value="views">播放量</option></select><select id="direction"><option value="desc">降序</option><option value="asc">升序</option></select><select id="watchedFilter" aria-label="观看状态"><option value="all">全部观看状态</option><option value="unwatched">未看完</option><option value="watched">已看完</option></select><button id="toggleView" type="button" aria-pressed="false">大播放视角</button><button id="randomPage" type="button">随机一页（30）</button><button id="queueViews" type="button">同步缺失播放量</button><a href="/" target="_blank" id="ledgerLink"><button type="button">下载台账</button></a><a href="/IwaraResilientQueue.user.js" target="_blank" id="scriptLink"><button type="button">更新网页脚本</button></a></header>
-<div id="layout" class="layout"><section><div class="toolbar"><button id="refresh" type="button">刷新列表</button><button id="loadMore" type="button" hidden>加载更多</button><span class="count" id="count"></span></div><div id="grid" class="grid"></div><div id="status" class="status"></div><div id="loadSentinel" class="load-sentinel" hidden aria-hidden="true"></div></section><aside class="player"><video id="mainVideo" controls playsinline preload="metadata"></video><h2 id="mainTitle">选择一个视频开始播放</h2><div id="mainMeta" class="player-meta">本地文件播放 · 不依赖 Iwara 页面</div><div id="playerState" class="player-state" hidden></div><div id="playerError" class="player-error" hidden></div><div class="player-actions"><button id="resumeBtn" type="button" disabled>继续播放</button><button id="markBtn" type="button" disabled>标记已看完</button><button id="openPage" type="button" disabled>打开原网页</button><button id="prevBtn" type="button" disabled>播放上一个</button><button id="nextBtn" type="button" disabled>播放下一个</button></div><div class="upnext"><h3>相邻视频</h3><div id="upnext"></div></div></aside></div>
+*{box-sizing:border-box}body{margin:0;background:#f2f6fb;color:#26374d;font:14px/1.5 "Segoe UI","Microsoft YaHei",system-ui}header{position:sticky;top:0;z-index:5;background:rgba(255,255,255,.96);border-bottom:1px solid #dce6f1;padding:14px 24px;display:flex;gap:16px;align-items:center;flex-wrap:wrap}header h1{font-size:21px;color:#17365f;margin:0 12px 0 0}header input{width:min(420px,60vw)}input,select,button{font:inherit;border:1px solid #cad8e8;border-radius:9px;background:#fff;color:#30445e;padding:9px 11px;min-height:38px}button{cursor:pointer;font-weight:600}button:hover{border-color:#5b8def;background:#eef5ff}.layout{max-width:1600px;margin:0 auto;padding:22px;display:grid;grid-template-columns:minmax(0,1fr) 390px;gap:20px}.layout.focus-player{grid-template-columns:minmax(0,1fr)}.layout.focus-player>section{display:none}.layout.focus-player .player{position:relative;top:0;width:min(1120px,100%);margin:0 auto;padding:18px}.layout.focus-player .player video{max-height:calc(100vh - 220px);object-fit:contain}.layout.focus-player .upnext{max-height:300px;overflow:auto}.toolbar{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-bottom:16px}.toolbar .count{margin-left:auto;color:#71829a}.page-info{color:#71829a;white-space:nowrap}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:15px}.card{background:#fff;border:1px solid #d9e4f0;border-radius:13px;overflow:hidden;cursor:pointer;box-shadow:0 4px 15px rgba(52,85,123,.07);transition:.15s}.card:hover,.card.active{border-color:#5b8def;transform:translateY(-2px);box-shadow:0 8px 22px rgba(49,101,185,.16)}.thumb{aspect-ratio:16/9;background:#dce8f4;position:relative;overflow:hidden}.thumb video{width:100%;height:100%;object-fit:cover;display:block}.badge{position:absolute;right:8px;bottom:7px;background:rgba(20,45,75,.75);color:#fff;padding:2px 6px;border-radius:5px;font-size:11px}.watch-badge{position:absolute;left:8px;bottom:7px;background:rgba(34,116,84,.86);color:#fff;padding:2px 6px;border-radius:5px;font-size:11px}.watch-badge.unwatched{background:rgba(72,92,120,.86)}.card-body{padding:10px 11px}.card-title{font-weight:700;color:#203957;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.meta{color:#72839a;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:4px}.card-progress{height:4px;background:#e4edf7;border-radius:4px;overflow:hidden;margin-top:7px}.card-progress i{display:block;height:100%;background:#5b8def}.empty{padding:50px;text-align:center;color:#7a899d;background:#fff;border:1px dashed #cbd8e6;border-radius:14px}.player{position:sticky;top:82px;background:#fff;border:1px solid #d9e4f0;border-radius:15px;padding:13px;box-shadow:0 5px 20px rgba(52,85,123,.1);height:max-content}.player video{display:block;width:100%;aspect-ratio:16/9;background:#dce8f4;border-radius:10px}.player h2{font-size:18px;line-height:1.35;margin:13px 0 6px;color:#17365f}.player-meta{color:#657890;display:flex;flex-wrap:wrap;gap:7px 13px}.player-actions{display:flex;gap:7px;margin-top:12px;flex-wrap:wrap}.player-state{margin-top:10px;padding:8px 10px;background:#f2f7ff;border-radius:8px;color:#536985}.player-error{margin-top:10px;padding:9px 10px;background:#fff3f1;border:1px solid #f0c4bd;border-radius:8px;color:#ad3f31;white-space:pre-wrap}.upnext{border-top:1px solid #e6edf5;margin-top:15px;padding-top:12px}.upnext h3{margin:0 0 9px;font-size:14px;color:#36516f}.next-row{display:flex;gap:9px;padding:7px 4px;border-radius:8px;cursor:pointer}.next-row:hover{background:#eef5ff}.next-row video{width:92px;height:52px;aspect-ratio:auto;border-radius:5px;object-fit:cover}.next-row b{display:block;font-size:12px;line-height:1.35;max-height:34px;overflow:hidden}.next-row span{display:block;color:#7a899d;font-size:11px}.status{margin:10px 0;color:#71829a;font-size:12px;min-height:18px}.load-sentinel{height:1px;width:100%;pointer-events:none}.load-sentinel[hidden]{display:none}[id*="idm" i],[class*="idm" i],[id*="internet-download-manager" i],[class*="internet-download-manager" i]{display:none!important}@media(max-width:1050px){.layout{grid-template-columns:1fr}.player{position:relative;top:0;grid-row:1}.grid{grid-template-columns:repeat(auto-fill,minmax(190px,1fr))}}@media(max-width:600px){header{position:relative;top:auto;z-index:auto;padding:12px 14px}.layout{padding:14px}.grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.card-body{padding:8px}.player{padding:9px}}</style>
+ <style>.single-mode header{justify-content:flex-start}.single-mode header input,.single-mode header select,.single-mode header #randomPage,.single-mode header #queueViews,.single-mode header #scriptLink,header #queueViews,header #refreshAllViews,header #queueTags,header #refreshAllTags,header #scriptLink{display:none}.single-mode .layout{padding-top:14px}.single-mode .player{box-shadow:0 8px 28px rgba(52,85,123,.12)}.selection-controls,.card-select{display:none}body:not(.single-mode) #layout>.player,body:not(.single-mode) #toggleView{display:none}body:not(.single-mode) .layout{display:block}.mode-badge{display:inline-flex;align-items:center;padding:5px 9px;border-radius:999px;background:#eef5ff;color:#36516f;font-size:12px;font-weight:700}.mode-badge.remote{background:#fff3df;color:#8b5b08}.next-row.compact-row{align-items:center;border:1px solid #e6edf5;margin:4px 0;padding:8px 10px}.next-row.compact-row .compact-index{min-width:30px;color:#71829a}.thumb .cover-image{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;z-index:1}.thumb .cover-fallback{position:absolute;inset:0;display:grid;place-items:center;color:#637a96;font-size:12px}.thumb .cover-fallback[hidden]{display:none}.thumb .badge,.thumb .watch-badge{z-index:2}.card-select{position:absolute;left:8px;top:8px;width:23px;height:23px;margin:0;z-index:4;accent-color:#4d83e6;cursor:pointer}.card.selected{border-color:#4d83e6;box-shadow:0 0 0 2px rgba(77,131,230,.18),0 8px 22px rgba(49,101,185,.16)}.selection-controls{display:inline-flex;gap:7px;align-items:center;flex-wrap:wrap}.selection-count{color:#71829a;white-space:nowrap}.tag-cloud{display:flex;gap:7px;align-items:center;flex-wrap:wrap;margin:8px 0 14px;padding:10px 12px;background:#f8fbff;border:1px solid #dfe8f3;border-radius:12px}.tag-cloud-label{color:#637a96;font-size:12px;font-weight:700;margin-right:2px}.tag-chip{border-radius:999px;padding:5px 10px;min-height:30px;font-size:12px;background:#fff;color:#36516f}.tag-chip.active{background:#eaf3ff;border-color:#5b8def;color:#1e5fae}</style>
+<header><h1>Iwara 本地播放列表</h1><span id="qualityMode" class="mode-badge"></span><button id="qualityToggle" type="button">切换画质</button><input id="query" placeholder="搜索标题、作者、标签或视频 ID"><select id="sort"><option value="updatedAt">最近下载</option><option value="title">标题</option><option value="author">作者</option><option value="uploadTime">上传日期</option><option value="views">播放量</option></select><select id="direction"><option value="desc">降序</option><option value="asc">升序</option></select><select id="watchedFilter" aria-label="观看状态"><option value="all">全部观看状态</option><option value="unwatched">未看完</option><option value="watched">已看完</option></select><button id="toggleView" type="button" aria-pressed="false">大播放视角</button><button id="randomPage" type="button">随机一页（30）</button><button id="queueViews" type="button">同步缺失播放量</button><button id="refreshAllViews" type="button">更新全部播放量</button><button id="queueTags" type="button">同步缺失标签</button><button id="refreshAllTags" type="button">更新全部标签</button><a href="/" target="_blank" id="ledgerLink"><button type="button">下载台账</button></a><a href="/IwaraResilientQueue.user.js" target="_blank" id="scriptLink"><button type="button">更新网页脚本</button></a></header><div id="tagCloud" class="tag-cloud" hidden></div>
+ <div id="layout" class="layout"><section><div class="toolbar"><button id="refresh" type="button">刷新列表</button><button id="loadMore" type="button" hidden>加载更多</button><span class="selection-controls"><button id="selectAll" type="button">全选当前列表</button><button id="clearSelection" type="button">清空选择</button><button id="downloadSelected" type="button" disabled>下载选中（0）</button><span id="selectionCount" class="selection-count">可勾选后保存本地文件</span></span><span class="count" id="count"></span><span class="page-info" id="pageInfo"></span></div><div id="grid" class="grid"></div><div id="status" class="status"></div><div id="loadSentinel" class="load-sentinel" hidden aria-hidden="true"></div></section><aside class="player"><video id="mainVideo" controls playsinline preload="metadata"></video><div id="audioOnlyBar" class="audio-only-bar" hidden><button id="audioPlayToggle" type="button">播放</button><input id="audioSeek" type="range" min="0" max="0" step="0.1" value="0" aria-label="音频播放进度"><span id="audioTime" class="audio-only-time">0:00 / 0:00</span></div><h2 id="mainTitle">选择一个视频开始播放</h2><div id="mainMeta" class="player-meta">本地文件播放 · 不依赖 Iwara 页面</div><div id="playerState" class="player-state" hidden></div><div id="playerError" class="player-error" hidden></div><div class="player-actions"><button id="resumeBtn" type="button" disabled>继续播放</button><button id="markBtn" type="button" disabled>标记已看完</button><button id="openPage" type="button" disabled>打开原网页</button><button id="prevBtn" type="button" disabled>播放上一个</button><button id="nextBtn" type="button" disabled>播放下一个</button><button id="playModeToggle" type="button" title="循环切换播放策略">播放模式：顺序播放</button></div><div class="upnext"><h3>相邻视频</h3><div id="upnext"></div></div></aside></div>
 <script>
+if(window.IntersectionObserver){const _IwaraIntersectionObserver=window.IntersectionObserver;window.IntersectionObserver=class extends _IwaraIntersectionObserver{constructor(callback,options={}){super(callback,{...options,rootMargin:'120px 0px'})}}}
+const _pageJumpStyle=document.createElement('style');_pageJumpStyle.textContent='.page-jump{display:inline-flex;align-items:center;gap:5px;color:#71829a;white-space:nowrap}.page-jump input{width:64px;min-height:34px;padding:6px 8px;text-align:center}';document.head.append(_pageJumpStyle);const _downloadUiStyle=document.createElement('style');_downloadUiStyle.textContent='.selection-controls,.card-select{display:none!important}';document.head.append(_downloadUiStyle);
+const _pageInfoNode=document.getElementById('pageInfo');
+const _playlistExtraStyle=document.createElement('style');_playlistExtraStyle.textContent='.filter-link{border:0;background:transparent;color:#4d76ae;padding:0;min-height:0;border-radius:0;font-size:inherit;font-weight:600;vertical-align:baseline}.filter-link:hover{border-color:transparent;background:transparent;text-decoration:underline}.tag-links{display:inline-flex;gap:4px;flex-wrap:wrap;vertical-align:middle}.tag-links .filter-link{font-weight:500}.layout.audio-only .player video{position:absolute;left:-10000px;width:1px;height:1px;opacity:0;pointer-events:none}';document.head.append(_playlistExtraStyle);
+const _authorFilterNode=document.createElement('select');_authorFilterNode.id='authorFilter';_authorFilterNode.setAttribute('aria-label','作者筛选');_authorFilterNode.innerHTML='<option value="all">全部作者</option>';document.getElementById('query')?.after(_authorFilterNode);
+const _audioModeButton=document.createElement('button');_audioModeButton.id='audioModeToggle';_audioModeButton.type='button';_audioModeButton.textContent='仅音频：关';_audioModeButton.title='隐藏视频画面，只保留声音播放';document.querySelector('.player-actions')?.append(_audioModeButton);
+const _audioOnlyControlStyle=document.createElement('style');_audioOnlyControlStyle.textContent='.audio-only-bar{display:none;align-items:center;gap:9px;width:100%;padding:9px 11px;background:#eef5ff;border:1px solid #d6e3f2;border-radius:10px}.audio-only-bar[hidden]{display:none!important}.audio-only-bar button{min-height:34px;padding:6px 10px}.audio-only-bar input[type=range]{flex:1;min-width:80px;accent-color:#4d83e6}.audio-only-time{min-width:92px;text-align:right;color:#637a96;font-size:12px;font-variant-numeric:tabular-nums}.layout.audio-only .player video{position:absolute;left:-10000px;width:1px;height:1px;opacity:0;pointer-events:none}.layout.audio-only .audio-only-bar{display:flex}';document.head.append(_audioOnlyControlStyle);
+if(_pageInfoNode){const _jump=document.createElement('label');_jump.className='page-jump';_jump.innerHTML='跳到 <input id="pageInput" type="number" min="1" step="1" inputmode="numeric" aria-label="页码"><span>页</span><button id="pageJump" type="button">确定</button>';_pageInfoNode.after(_jump);const _pageInput=_jump.querySelector('#pageInput'),_pageJumpButton=_jump.querySelector('#pageJump');const _jumpToPage=()=>{const target=Number(_pageInput.value),max=Math.max(1,Math.ceil(Number(window.__iwaraTotalItems||0)/30));if(!Number.isInteger(target)||target<1||target>max){_pageInput.setCustomValidity('请输入 1 到 '+max+' 之间的页码');_pageInput.reportValidity();return}_pageInput.setCustomValidity('');window.__iwaraJumpPage=target;window.dispatchEvent(new CustomEvent('iwara-page-jump'))};_pageJumpButton.onclick=_jumpToPage;_pageInput.onkeydown=event=>{if(event.key==='Enter'){event.preventDefault();_jumpToPage()}};new MutationObserver(()=>{const current=Number(window.__iwaraCurrentPage||1);if(document.activeElement!==_pageInput)_pageInput.value=String(current)}).observe(_pageInfoNode,{subtree:true,childList:true,characterData:true});window.addEventListener('iwara-page-jump',()=>{const target=Number(window.__iwaraJumpPage);if(Number.isInteger(target))window.__iwaraSetPage?.(target)})}
+// Plyr integration intentionally disabled for now.  Keeping the native
+// <video controls> element avoids an extra wrapper and lets Chrome own
+// fullscreen/Picture-in-Picture behavior without the custom-player overhead.
 const $=id=>document.getElementById(id), esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])), date=v=>v?new Date(v).toLocaleDateString('zh-CN'):'—', views=v=>v==null?'播放量待同步':Number(v).toLocaleString('zh-CN')+' 次播放';
 const routeParams=new URLSearchParams(location.search);
-let items=[],current=-1,timer,pageNo=Math.max(1,Number(routeParams.get('page')||1)||1),totalItems=0,globalIndex=null,hasPrevious=false,hasNext=false,loading=false,loadObserver=null,pendingPlay=routeParams.get('play')||'',sourcePage=routeParams.get('from')||'',singleVideoMode=location.pathname==='/player'||Boolean(pendingPlay),playbackSaveTimer=null,lastPlaybackPosition=-1,lastPlaybackWatched=false;
+let audioOnly=false;
+try{audioOnly=localStorage.getItem('iwara-audio-only')==='1'}catch{}
+function formatAudioTime(value){const seconds=Math.max(0,Math.floor(Number(value)||0));const h=Math.floor(seconds/3600),m=Math.floor((seconds%3600)/60),s=seconds%60;return h?(h+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0')):(m+':'+String(s).padStart(2,'0'))}
+function updateAudioOnlyControls(){const v=$('mainVideo'),seek=$('audioSeek'),time=$('audioTime'),button=$('audioPlayToggle');if(!v||!seek||!time||!button)return;const duration=Number(v.duration);const current=Number(v.currentTime)||0;if(Number.isFinite(duration)&&duration>0){seek.max=String(duration);seek.value=String(Math.min(duration,current))}else{seek.max='0';seek.value='0'}time.textContent=formatAudioTime(current)+' / '+formatAudioTime(duration);button.textContent=v.paused?'播放':'暂停';button.title=v.paused?'播放音频':'暂停音频'}
+function setAudioOnly(enabled){audioOnly=Boolean(enabled);$('layout')?.classList.toggle('audio-only',audioOnly);const button=$('audioModeToggle');const bar=$('audioOnlyBar');if(bar)bar.hidden=!audioOnly;if(button){button.textContent=audioOnly?'仅音频：开':'仅音频：关';button.title=audioOnly?'恢复视频画面':'隐藏视频画面，只保留声音播放'}updateAudioOnlyControls();try{localStorage.setItem('iwara-audio-only',audioOnly?'1':'0')}catch{} }
+function applyPlaylistFilter(value,kind='query'){const text=String(value||'').trim();if(kind==='author'&&$('authorFilter'))$('authorFilter').value=text;if(kind==='tag'&&$('authorFilter'))$('authorFilter').value='all';$('query').value=text;pageNo=1;load(true);}
+function decorateCardFilters(){if(singleVideoMode)return;document.querySelectorAll('.card').forEach((node,index)=>{const task=items[index];if(!task)return;const metas=node.querySelectorAll('.meta');const author=String(task.author||'').trim();const authorLabel=String(task.alias||author||'未知作者');if(metas[0]){metas[0].replaceChildren();if(author){const button=document.createElement('button');button.type='button';button.className='filter-link';button.textContent=authorLabel;button.title='只显示作者：'+author;button.onclick=event=>{event.preventDefault();event.stopPropagation();applyPlaylistFilter(author,'author')};metas[0].append(button)}else metas[0].append(document.createTextNode(authorLabel));metas[0].append(document.createTextNode(' · '+date(task.uploadTime)))}if(metas[2]){const tags=Array.isArray(task.tags)?task.tags.filter(Boolean):[];metas[2].replaceChildren(document.createTextNode('标签：'));if(!tags.length){metas[2].append(document.createTextNode('暂无标签'));return}const links=document.createElement('span');links.className='tag-links';tags.forEach((tag,tagIndex)=>{const button=document.createElement('button');button.type='button';button.className='filter-link';button.textContent=tag;button.title='只显示标签：'+tag;button.onclick=event=>{event.preventDefault();event.stopPropagation();applyPlaylistFilter(tag,'tag')};links.append(button);if(tagIndex<tags.length-1)links.append(document.createTextNode(' · '))});metas[2].append(links)}})}
+async function loadAuthorFilter(){const select=$('authorFilter');if(!select)return;try{const r=await fetch('/api/ledger?page=1&pageSize=1',{cache:'no-store'}),data=await r.json();if(!r.ok)throw Error(data.error||r.status);const current=select.value;select.innerHTML='<option value="all">全部作者</option>'+(Array.isArray(data.authors)?data.authors.map(item=>'<option value="'+esc(item.author)+'">'+esc(item.alias?item.alias+' (@'+item.author+')':item.author)+' · '+Number(item.count||0)+'</option>').join(''):'');if([...select.options].some(option=>option.value===current))select.value=current}catch{}}
+const _originalPlaylistRender=render;render=()=>{_originalPlaylistRender();decorateCardFilters()};
+_authorFilterNode.onchange=()=>{const value=_authorFilterNode.value||'all';$('query').value=value==='all'?'':value;pageNo=1;load(true)};
+setAudioOnly(audioOnly);_audioModeButton.onclick=()=>{setAudioOnly(!audioOnly);$('status').textContent=audioOnly?'已切换为仅音频背景播放；下方控制条可拖动进度。':'已恢复视频画面。'};$('audioPlayToggle').onclick=()=>{const v=$('mainVideo');(v.paused?v.play():v.pause()).catch(()=>{});updateAudioOnlyControls()};$('audioSeek').oninput=event=>{const v=$('mainVideo');const value=Number(event.target.value);if(Number.isFinite(value))v.currentTime=value;updateAudioOnlyControls()};['timeupdate','loadedmetadata','durationchange','play','pause','ended','emptied'].forEach(event=>$('mainVideo').addEventListener(event,updateAudioOnlyControls));
+if(!routeParams.has('page')&&!routeParams.has('play'))routeParams.set('page','1');
+ let playbackProfile=routeParams.get('profile')==='remote'?'remote':'local';
+ let items=[],current=-1,timer,pageNo=Math.max(1,Number(routeParams.get('page')||1)||1),totalItems=0,globalIndex=null,hasPrevious=false,hasNext=false,loading=false,loadObserver=null,pendingPlay=routeParams.get('play')||'',sourcePage=routeParams.get('from')||'',singleVideoMode=location.pathname==='/player'||Boolean(pendingPlay),playbackSaveTimer=null,lastPlaybackPosition=-1,lastPlaybackWatched=false,selectedIds=new Set(),popularTags=[];
+const playbackModes={sequence:{label:'顺序播放',title:'按列表顺序播放，到末尾停止'},loop:{label:'顺序循环',title:'按列表顺序播放，到末尾回到第一条'},random:{label:'随机播放',title:'每次播放结束后随机选择下一条'},single:{label:'单曲循环',title:'当前视频结束后重新播放当前视频'}};
+let playbackMode='sequence';
+try{const savedMode=localStorage.getItem('iwara-playback-mode');if(playbackModes[savedMode])playbackMode=savedMode}catch{}
 let initialLoad=true;
+window.__iwaraSetPage=target=>{pageNo=Math.max(1,Number(target)||1);initialLoad=true;load(true,false)};
+setInterval(()=>{window.__iwaraTotalItems=totalItems;window.__iwaraCurrentPage=pageNo},300);
 try{if(!sourcePage)sourcePage=sessionStorage.getItem('iwara-playlist-source')||''}catch{}
-function openStandalone(i){const t=items[i];if(!t)return;const from=location.pathname+location.search;try{sessionStorage.setItem('iwara-playlist-source',from)}catch{};const q=new URLSearchParams({play:t.id,from});window.location.href='/player?'+q.toString()}
+function openStandalone(i){const t=items[i];if(!t)return;const sourceUrl=new URL(location.href);sourceUrl.searchParams.set('profile',playbackProfile);const from=sourceUrl.pathname+sourceUrl.search;try{sessionStorage.setItem('iwara-playlist-source',from)}catch{};const q=new URLSearchParams({play:t.id,from,profile:playbackProfile});window.location.href='/player?'+q.toString()}
 function backToSource(){const target=sourcePage||'/playlist';try{sessionStorage.removeItem('iwara-playlist-source')}catch{};window.location.replace(target)}
-function syncListUrl(){if(singleVideoMode)return;const q=new URLSearchParams();const query=$('query').value.trim(),sort=$('sort').value,direction=$('direction').value,watched=$('watchedFilter').value;if(query)q.set('query',query);if(sort!=='updatedAt')q.set('sort',sort);if(direction!=='desc')q.set('direction',direction);if(watched!=='all')q.set('watched',watched);if(pageNo>1)q.set('page',String(pageNo));const next='/playlist'+(q.toString()?'?'+q.toString():'');history.replaceState(null,'',next)}
+function syncListUrl(){if(singleVideoMode)return;const q=new URLSearchParams();const query=$('query').value.trim(),sort=$('sort').value,direction=$('direction').value,watched=$('watchedFilter').value;if(playbackProfile==='remote'||playbackProfile==='local')q.set('profile',playbackProfile);if(query)q.set('query',query);if(sort!=='updatedAt')q.set('sort',sort);if(direction!=='desc')q.set('direction',direction);if(watched!=='all')q.set('watched',watched);if(pageNo>1)q.set('page',String(pageNo));const next='/playlist'+(q.toString()?'?'+q.toString():'');history.replaceState(null,'',next)}
+function renderTagCloud(){const target=$('tagCloud');if(!target)return;if(singleVideoMode||!popularTags.length){target.hidden=true;target.replaceChildren();return}const query=$('query').value.trim();target.hidden=false;target.innerHTML='<span class="tag-cloud-label">高频标签</span>'+popularTags.map(item=>'<button type="button" class="tag-chip '+(query===item.tag?'active':'')+'" data-tag="'+esc(item.tag)+'">'+esc(item.tag)+' <small>'+Number(item.count||0)+'</small></button>').join('');target.querySelectorAll('.tag-chip').forEach(button=>button.addEventListener('click',()=>{const tag=button.dataset.tag||'';$('query').value=$('query').value.trim()===tag?'':tag;load(true)}))}
+async function loadPopularTags(){try{const r=await fetch('/api/playlist-tags?limit=18',{cache:'no-store'});const data=await r.json();if(!r.ok)throw Error(data.error||r.status);popularTags=Array.isArray(data.tags)?data.tags:[];renderTagCloud()}catch{popularTags=[];renderTagCloud()}}
 function progressInfo(t){const duration=Number(t.playbackDuration||0),position=Math.max(0,Number(t.playbackPosition||0));return{duration,position,pct:duration?Math.min(100,position/duration*100):0}}
 function watchLabel(t){const p=progressInfo(t);return t.watched?'已看完':p.position>1?'未看完':'未播放'}
 function bindCoverStatus(){document.querySelectorAll('.thumb .cover-image').forEach(image=>{const fallback=image.previousElementSibling;image.onload=()=>{fallback.hidden=true};image.onerror=()=>{image.hidden=true;fallback.textContent='封面暂不可用'};if(image.complete&&image.naturalWidth)fallback.hidden=true})}
-function card(t,i){const p=progressInfo(t);return '<article class="card '+(i===current?'active':'')+'" data-index="'+i+'"><div class="thumb"><span class="cover-fallback">正在加载封面</span><img class="cover-image" src="'+esc(t.coverUrl)+'" alt="" loading="lazy"><span class="watch-badge '+(t.watched?'':'unwatched')+'">'+watchLabel(t)+'</span><span class="badge">本地</span></div><div class="card-body"><div class="card-title" title="'+esc(t.title||t.videoId)+'">'+esc(t.title||t.videoId)+'</div><div class="meta">'+esc(t.alias||t.author||'未知作者')+' · '+esc(date(t.uploadTime))+'</div><div class="meta">'+esc(views(t.views))+'</div><div class="card-progress"><i style="width:'+p.pct+'%"></i></div></div></article>'}
-function render(){if(singleVideoMode){$('grid').innerHTML='';$('count').textContent='';$('loadMore').hidden=true;$('loadSentinel').hidden=true}else{$('grid').innerHTML=items.length?items.map(card).join(''):'<div class="empty">没有可播放的本地视频</div>';$('count').textContent=(totalItems&&items.length<totalItems?items.length+' / ':'')+(totalItems||items.length)+' 个本地视频';const more=Boolean(totalItems&&items.length<totalItems);$('loadMore').hidden=!more;$('loadSentinel').hidden=!more}document.querySelectorAll('.card').forEach(c=>c.onclick=e=>{const i=Number(c.dataset.index);if(singleVideoMode)select(i,e);else openStandalone(i)});renderNext();bindCoverStatus()}
+ function card(t,i){const p=progressInfo(t),selected=selectedIds.has(t.id),tags=Array.isArray(t.tags)&&t.tags.length?t.tags.join(' · '):'暂无标签';return '<article class="card '+(i===current?'active ':'')+(selected?'selected':'')+'" data-index="'+i+'"><div class="thumb"><span class="cover-fallback">正在加载封面</span><img class="cover-image" src="'+esc(t.coverUrl)+'" alt="" loading="lazy"><input class="card-select" type="checkbox" data-selection-id="'+esc(t.id)+'" aria-label="选择 '+esc(t.title||t.videoId)+'" '+(selected?'checked':'')+'><span class="watch-badge '+(t.watched?'':'unwatched')+'">'+watchLabel(t)+'</span><span class="badge">本地</span></div><div class="card-body"><div class="card-title" title="'+esc(t.title||t.videoId)+'">'+esc(t.title||t.videoId)+'</div><div class="meta">'+esc(t.alias||t.author||'未知作者')+' · '+esc(date(t.uploadTime))+'</div><div class="meta">'+esc(views(t.views))+'</div><div class="meta" title="'+esc(tags)+'">标签：'+esc(tags)+'</div><div class="card-progress"><i style="width:'+p.pct+'%"></i></div></div></article>'}
+ function updateSelectionUi(){const count=selectedIds.size,button=$('downloadSelected'),label=$('selectionCount');if(button){button.disabled=count!==1;button.textContent='下载选中（'+count+'）';button.title=count===1?'保存已选本地视频':'一次请选择一个视频'}if(label)label.textContent=count?'已选择 '+count+' 个视频':'可勾选后保存本地文件';document.querySelectorAll('.card').forEach(c=>{const box=c.querySelector('.card-select');c.classList.toggle('selected',Boolean(box?.checked))})}
+ function bindSelection(){document.querySelectorAll('.card-select').forEach(box=>{box.onchange=event=>{event.stopPropagation();const id=box.dataset.selectionId;if(box.checked)selectedIds.add(id);else selectedIds.delete(id);updateSelectionUi()};box.onclick=event=>event.stopPropagation()});updateSelectionUi()}
+ function downloadSelected(){const chosen=items.filter(item=>selectedIds.has(item.id));if(chosen.length!==1){$('status').textContent='一次请选择一个视频后再下载。';return}const item=chosen[0];if(!item.downloadUrl){$('status').textContent='该视频暂时没有可下载地址。';return}const link=document.createElement('a');link.href=item.downloadUrl;link.download='';link.rel='noopener';document.body.append(link);link.click();link.remove();$('status').textContent='已开始下载：'+(item.title||item.localFileName||item.videoId);}
+ function render(){if(singleVideoMode){$('grid').innerHTML='';$('count').textContent='';$('pageInfo').textContent='';$('loadMore').hidden=true;$('loadSentinel').hidden=true}else{$('grid').innerHTML=items.length?items.map(card).join(''):'<div class="empty">没有可播放的本地视频</div>';$('count').textContent=(totalItems&&items.length<totalItems?items.length+' / ':'')+(totalItems||items.length)+' 个本地视频';const pageCount=Math.max(1,Math.ceil(totalItems/30));$('pageInfo').textContent=totalItems?'第 '+Math.min(pageNo,pageCount)+' / '+pageCount+' 页':'';const more=Boolean(totalItems&&items.length<totalItems);$('loadMore').hidden=!more;$('loadSentinel').hidden=!more}document.querySelectorAll('.card').forEach(c=>c.onclick=e=>{const i=Number(c.dataset.index);if(singleVideoMode)select(i,e);else openStandalone(i)});bindSelection();renderNext();bindCoverStatus()}
 function loadNextPage(){if(singleVideoMode||loading||!totalItems||items.length>=totalItems)return;pageNo+=1;void load(false)}
 function setupInfiniteScroll(){if(singleVideoMode)return;const sentinel=$('loadSentinel');if(!sentinel)return;loadObserver?.disconnect();if('IntersectionObserver' in window){loadObserver=new IntersectionObserver(entries=>{if(entries.some(entry=>entry.isIntersecting))loadNextPage()},{rootMargin:'720px 0px',threshold:0});loadObserver.observe(sentinel);return}const check=()=>{if(innerHeight+scrollY>=document.documentElement.scrollHeight-720)loadNextPage()};window.addEventListener('scroll',check,{passive:true});window.addEventListener('resize',check,{passive:true})}
 function renderNext(){if(!singleVideoMode){$('upnext').innerHTML='';return}const available=items.map((t,index)=>({t,index})).filter(x=>x.index!==current).sort((a,b)=>Math.abs(a.index-current)-Math.abs(b.index-current)).slice(0,4);$('upnext').innerHTML=available.map(({t,index})=>'<div class="next-row compact-row" data-index="'+index+'"><span class="compact-index">'+(index<current?'上一个':'下一个')+'</span><img class="cover-image" src="'+esc(t.coverUrl)+'" alt="" loading="lazy" style="width:92px;height:52px;object-fit:cover;border-radius:5px"><div><b>'+esc(t.title||t.videoId)+'</b><span>'+esc(t.alias||t.author||'未知作者')+'</span></div></div>').join('')||'<div class="meta">没有相邻视频</div>';document.querySelectorAll('.next-row').forEach(c=>c.onclick=e=>select(Number(c.dataset.index),e))}
 function playerErrorText(error){const code=Number(error?.code||0);if(code===4)return '浏览器无法识别播放资源，正在核对文件服务的实际响应。';if(code===3)return '浏览器解码失败；文件可能损坏，或当前浏览器不支持其编码。';if(code===2)return '读取本地文件时网络中断，请稍后重试。';return '播放器无法打开该文件，正在检查原因。'}
-function mediaHttpError(status){if(status===401)return '局域网视频请求未通过授权（HTTP 401）。请从台账复制局域网播放链接重新打开；视频地址会自动携带独立访问票据。';if(status===403)return '本地文件被拒绝访问（HTTP 403）；请检查服务权限和下载目录。';if(status===404)return '本地文件确实不存在（HTTP 404）；请检查台账中的文件位置。';if(status===416)return '手机浏览器请求的视频分段无效（HTTP 416）；请刷新播放器重试。';if(status>=400)return '本地文件服务返回 HTTP '+status+'，暂时无法读取。';return ''}
+function mediaHttpError(status){if(status===401)return '局域网视频请求未通过授权（HTTP 401）。请从台账复制局域网播放链接重新打开；视频地址会自动携带独立访问票据。';if(status===403)return '本地文件被拒绝访问（HTTP 403）；请检查服务权限和下载目录。';if(status===404)return '本地文件确实不存在（HTTP 404）；请检查台账中的文件位置。';if(status===416)return '手机浏览器请求的视频分段无效（HTTP 416）；请刷新播放器重试。';if(status===503)return '远程 480p 转码暂时失败（HTTP 503）；请确认 FFmpeg 可用，稍后重试或切回局域网原画模式。';if(status>=400)return '本地文件服务返回 HTTP '+status+'，暂时无法读取。';return ''}
 async function explainMediaFailure(video,task){
   const token=task?.id;
   let message=playerErrorText(video?.error);
@@ -292,17 +382,61 @@ async function explainMediaFailure(video,task){
   if(items[current]?.id===token)showPlayerError(message);
 }
 function showPlayerError(message){const node=$('playerError');node.textContent=message||'';node.hidden=!message}
-function updatePlayerState(t){const p=progressInfo(t);const state=t.watched?'已看完':p.position>1?'未看完 · 已看到 '+Math.floor(p.position/60)+':'+String(Math.floor(p.position%60)).padStart(2,'0'):'尚未播放';$('playerState').textContent=state;$('playerState').hidden=false;$('resumeBtn').disabled=!(p.position>1&&!t.watched);$('markBtn').disabled=false;$('markBtn').textContent=t.watched?'标记未看完':'标记已看完'}
+function updatePlayerState(t){const p=progressInfo(t);const mode=t.playbackProfile==='remote'?'远程480p · ':'';const state=t.watched?'已看完':p.position>1?'未看完 · 已看到 '+Math.floor(p.position/60)+':'+String(Math.floor(p.position%60)).padStart(2,'0'):'尚未播放';$('playerState').textContent=mode+state;$('playerState').hidden=false;$('resumeBtn').disabled=!(p.position>1&&!t.watched);$('markBtn').disabled=false;$('markBtn').textContent=t.watched?'标记未看完':'标记已看完'}
 function persistPlayback(force=false,watchedOverride=null){if(current<0||!items[current])return;const t=items[current],v=$('mainVideo'),duration=Number(v.duration||t.playbackDuration||0),position=Number(v.currentTime||0);if(!Number.isFinite(position)||!Number.isFinite(duration)||duration<=0)return;const watched=typeof watchedOverride==='boolean'?watchedOverride:(v.ended||position/duration>=.95);if(!force&&Math.abs(position-lastPlaybackPosition)<2&&watched===lastPlaybackWatched)return;lastPlaybackPosition=position;lastPlaybackWatched=watched;const payload={position,duration,watched};t.playbackPosition=position;t.playbackDuration=duration;t.watched=watched;updatePlayerState(t);fetch('/api/playback/'+encodeURIComponent(t.id),{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload),keepalive:force}).then(r=>r.ok?r.json():null).then(saved=>{if(saved){Object.assign(t,{playbackPosition:saved.playbackPosition,playbackDuration:saved.playbackDuration,watched:saved.watched,playbackUpdatedAt:saved.playbackUpdatedAt})}}).catch(()=>{})}
 function schedulePlaybackSave(){clearTimeout(playbackSaveTimer);playbackSaveTimer=setTimeout(()=>persistPlayback(false),800)}
 function sendPlaybackBeacon(){if(current<0||!items[current])return;const v=$('mainVideo'),duration=Number(v.duration||0),position=Number(v.currentTime||0);if(!Number.isFinite(duration)||duration<=0)return;const body=JSON.stringify({position,duration,watched:v.ended||position/duration>=.95});try{navigator.sendBeacon('/api/playback/'+encodeURIComponent(items[current].id),new Blob([body],{type:'application/json'}))}catch{persistPlayback(true)}}
+const _persistPlaybackWithoutAudioGate=persistPlayback;persistPlayback=(...args)=>audioOnly?undefined:_persistPlaybackWithoutAudioGate(...args);const _sendPlaybackBeaconWithoutAudioGate=sendPlaybackBeacon;sendPlaybackBeacon=(...args)=>audioOnly?undefined:_sendPlaybackBeaconWithoutAudioGate(...args);
+function updatePlaybackModeButton(){const button=$('playModeToggle'),mode=playbackModes[playbackMode]||playbackModes.sequence;if(button){button.textContent='播放模式：'+mode.label;button.title=mode.title}}
+function setPlaybackMode(mode){playbackMode=playbackModes[mode]?mode:'sequence';try{localStorage.setItem('iwara-playback-mode',playbackMode)}catch{}updatePlaybackModeButton()}
+function cyclePlaybackMode(){const modes=Object.keys(playbackModes),index=modes.indexOf(playbackMode);setPlaybackMode(modes[(index+1)%modes.length]);$('status').textContent='已切换为'+playbackModes[playbackMode].label}
+async function loadContextIndex(targetGlobal,statusText='正在读取相邻视频…'){
+  if(!singleVideoMode||!Number.isSafeInteger(Number(targetGlobal)))return false;
+  const target=Math.max(0,Math.min(totalItems-1,Number(targetGlobal)));
+  const p=new URLSearchParams({sort:$('sort').value,direction:$('direction').value,watched:'all',page:'1',pageSize:'30',contextIndex:String(target),contextSize:'5',profile:playbackProfile});
+  $('status').textContent=statusText;
+  try{
+    const r=await fetch('/playlist-data?'+p,{cache:'no-store'}),d=await r.json();
+    if(!r.ok)throw Error(d.error||r.status);
+    items=d.items||[];totalItems=Number(d.total||totalItems);globalIndex=Number.isInteger(Number(d.globalIndex))?Number(d.globalIndex):target;hasPrevious=Boolean(d.hasPrevious);hasNext=Boolean(d.hasNext);current=Number.isInteger(Number(d.currentIndex))?Number(d.currentIndex):0;
+    showPlayerError(d.playerError?.message||'');render();
+    if(items.length){select(current,null,true);$('status').textContent='已加载相邻视频；当前为'+playbackModes[playbackMode].label+'。';return true}
+  }catch(error){$('status').textContent='读取相邻视频失败：'+error.message}
+  return false
+}
+async function playRandomNext(){
+  if(!singleVideoMode)return;
+  if(totalItems<=1){$('status').textContent='可随机播放的视频不足。';return}
+  const previousId=items[current]?.id;
+  const p=new URLSearchParams({query:'',sort:$('sort').value,direction:$('direction').value,watched:'all',page:'1',pageSize:'30',randomPage:'1',profile:playbackProfile});
+  $('status').textContent='正在随机选择下一条视频…';
+  try{
+    const r=await fetch('/playlist-data?'+p,{cache:'no-store'}),d=await r.json();
+    if(!r.ok)throw Error(d.error||r.status);
+    const candidates=(d.items||[]).filter(item=>item.id!==previousId);
+    if(!candidates.length)throw Error('没有可用的随机视频');
+    items=d.items||[];totalItems=Number(d.total||totalItems);pageNo=Number(d.page||1);current=items.indexOf(candidates[Math.floor(Math.random()*candidates.length)]);const randomPageSize=Number(d.pageSize||30);globalIndex=Math.max(0,(pageNo-1)*randomPageSize+current);hasPrevious=globalIndex>0;hasNext=globalIndex<totalItems-1;
+    showPlayerError(d.playerError?.message||'');render();select(current,null,true);$('status').textContent='已随机播放下一条视频。';
+  }catch(error){$('status').textContent='随机选择失败：'+error.message}
+}
+async function handlePlaybackEnded(){
+  persistPlayback(true);
+  if(playbackMode==='single'){
+    const video=$('mainVideo');video.currentTime=0;video.play().catch(()=>{});return;
+  }
+  if(playbackMode==='random'){await playRandomNext();return}
+  if(current<items.length-1){select(current+1,null,true);return}
+  if(hasNext){await navigateAdjacent(1);return}
+  if(playbackMode==='loop'&&totalItems>0){await loadContextIndex(0,'顺序循环：正在回到第一条视频…');return}
+  $('status').textContent='顺序播放已到列表末尾。';
+}
 async function navigateAdjacent(direction){
   const target=current+direction;
   if(target>=0&&target<items.length){select(target,null,true);return}
   if(!singleVideoMode||!Number.isSafeInteger(globalIndex))return;
   const targetGlobal=globalIndex+direction;
   if(targetGlobal<0||targetGlobal>=totalItems)return;
-  const p=new URLSearchParams({sort:$('sort').value,direction:$('direction').value,watched:'all',page:'1',pageSize:'30',contextIndex:String(targetGlobal),contextSize:'5'});
+  const p=new URLSearchParams({sort:$('sort').value,direction:$('direction').value,watched:'all',page:'1',pageSize:'30',contextIndex:String(targetGlobal),contextSize:'5'});p.set('profile',playbackProfile);
   $('status').textContent='正在读取相邻视频…';
   try{
     const r=await fetch('/playlist-data?'+p,{cache:'no-store'}),d=await r.json();
@@ -311,29 +445,38 @@ async function navigateAdjacent(direction){
     showPlayerError(d.playerError?.message||'');render();if(items.length)select(current,null,true);$('status').textContent='已加载相邻视频；只保留当前视频和少量切换项。';
   }catch(error){$('status').textContent='读取相邻视频失败：'+error.message}
 }
-function select(i,event,fromUser=false){if(event){event.preventDefault();event.stopPropagation()}if(!items[i])return;if(current>=0&&current!==i){persistPlayback(true);if(Number.isSafeInteger(globalIndex))globalIndex+=i-current}current=i;lastPlaybackPosition=-1;lastPlaybackWatched=false;const t=items[i],v=$('mainVideo');if(event||fromUser){v.muted=false;v.autoplay=false}if(singleVideoMode){const q=new URLSearchParams(location.search);q.set('play',t.id);history.replaceState(null,'','/player?'+q.toString())}showPlayerError('');$('playerState').hidden=false;updatePlayerState(t);t.mediaStartedAt=Date.now();v.src=t.streamUrl;v.load();v.addEventListener('loadedmetadata',function restore(){const p=progressInfo(t);if(!t.watched&&p.position>1&&p.position<v.duration-1){try{v.currentTime=p.position}catch{}}updatePlayerState(t)},{once:true});v.play().catch(()=>{});$('mainTitle').textContent=t.title||t.videoId;$('mainMeta').innerHTML='<span>'+esc(t.alias||t.author||'未知作者')+'</span><span>'+esc(date(t.uploadTime))+'</span><span>'+esc(views(t.views))+'</span><span>'+esc(t.localFileName||'本地文件')+'</span>';$('openPage').disabled=!t.sourcePage;$('openPage').onclick=()=>window.open(t.sourcePage,'_blank','noopener');$('resumeBtn').onclick=()=>{const p=progressInfo(t);if(p.position>0){try{v.currentTime=p.position}catch{};v.play().catch(()=>{})}};$('markBtn').onclick=()=>{t.watched=!t.watched;persistPlayback(true,t.watched);updatePlayerState(t);render()};$('prevBtn').disabled=current<0||(!hasPrevious&&current<=0);$('prevBtn').onclick=()=>navigateAdjacent(-1);$('nextBtn').disabled=current<0||(!hasNext&&current>=items.length-1);$('nextBtn').onclick=()=>navigateAdjacent(1);document.querySelectorAll('.card').forEach(c=>c.classList.toggle('active',Number(c.dataset.index)===current));renderNext()}
-async function load(reset=true,randomize=false){
-  if(loading)return;clearTimeout(timer);
-  if(reset){if(!(initialLoad&&!randomize&&!singleVideoMode))pageNo=1;items=[];current=-1;globalIndex=null;hasPrevious=false;hasNext=false}
+function select(i,event,fromUser=false){if(event){event.preventDefault();event.stopPropagation()}if(!items[i])return;if(current>=0&&current!==i){persistPlayback(true);if(Number.isSafeInteger(globalIndex))globalIndex+=i-current}current=i;lastPlaybackPosition=-1;lastPlaybackWatched=false;const t=items[i],v=$('mainVideo');if(event||fromUser){v.muted=false;v.autoplay=false}if(singleVideoMode){const q=new URLSearchParams(location.search);q.set('play',t.id);history.replaceState(null,'','/player?'+q.toString())}showPlayerError('');$('playerState').hidden=false;updatePlayerState(t);t.mediaStartedAt=Date.now();v.src=t.streamUrl;v.load();v.addEventListener('loadedmetadata',function restore(){const p=progressInfo(t);if(!t.watched&&p.position>1&&p.position<v.duration-1){try{v.currentTime=p.position}catch{}}updatePlayerState(t)},{once:true});v.play().catch(()=>{});$('mainTitle').textContent=t.title||t.videoId;$('mainMeta').innerHTML='<span>'+esc(t.alias||t.author||'未知作者')+'</span><span>'+esc(date(t.uploadTime))+'</span><span>'+esc(views(t.views))+'</span><span>标签：'+esc(Array.isArray(t.tags)&&t.tags.length?t.tags.join(' · '):'暂无标签')+'</span><span>'+esc(t.localFileName||'本地文件')+'</span>';$('openPage').disabled=!t.sourcePage;$('openPage').onclick=()=>window.open(t.sourcePage,'_blank','noopener');$('resumeBtn').onclick=()=>{const p=progressInfo(t);if(p.position>0){try{v.currentTime=p.position}catch{};v.play().catch(()=>{})}};$('markBtn').onclick=()=>{t.watched=!t.watched;persistPlayback(true,t.watched);updatePlayerState(t);render()};$('prevBtn').disabled=current<0||(!hasPrevious&&current<=0);$('prevBtn').onclick=()=>navigateAdjacent(-1);$('nextBtn').disabled=current<0||(!hasNext&&current>=items.length-1);$('nextBtn').onclick=()=>navigateAdjacent(1);document.querySelectorAll('.card').forEach(c=>c.classList.toggle('active',Number(c.dataset.index)===current));renderNext()}
+ async function load(reset=true,randomize=false){
+   if(loading)return;clearTimeout(timer);
+   if(reset){if(!(initialLoad&&!randomize&&!singleVideoMode))pageNo=1;items=[];current=-1;globalIndex=null;hasPrevious=false;hasNext=false;selectedIds.clear();updateSelectionUi()}
   loading=true;const targetPlay=pendingPlay;
   $('status').textContent=targetPlay?'正在打开指定本地视频…':(randomize?'正在随机读取一页视频…':'正在读取本地列表…');
-  const p=new URLSearchParams({query:singleVideoMode?'':$('query').value.trim(),sort:$('sort').value,direction:$('direction').value,watched:singleVideoMode?'all':$('watchedFilter').value,page:String(pageNo),pageSize:'30'});
+  const p=new URLSearchParams({query:singleVideoMode?'':$('query').value.trim(),sort:$('sort').value,direction:$('direction').value,watched:singleVideoMode?'all':$('watchedFilter').value,page:String(pageNo),pageSize:'30'});p.set('profile',playbackProfile);
   if(targetPlay){p.set('contextId',targetPlay);p.set('contextSize','5')}else if(randomize)p.set('randomPage','1');
   try{
-    const r=await fetch('/playlist-data?'+p,{cache:'no-store'}),d=await r.json();if(!r.ok)throw Error(d.error||r.status);
+    const r=await fetch('/playlist-data?'+p,{cache:'no-store'}),d=await r.json();if(!r.ok)throw Error(d.error||r.status);if(d.playbackProfile==='remote'||d.playbackProfile==='local')setPlaybackProfile(d.playbackProfile);
     totalItems=Number(d.total||0);pageNo=Number(d.page||pageNo);items=reset?(d.items||[]):items.concat(d.items||[]);
     if(targetPlay){
       pendingPlay='';if(d.playerError)showPlayerError(d.playerError.message);globalIndex=Number.isInteger(Number(d.globalIndex))?Number(d.globalIndex):null;hasPrevious=Boolean(d.hasPrevious);hasNext=Boolean(d.hasNext);current=Number.isInteger(Number(d.currentIndex))&&Number(d.currentIndex)>=0?Number(d.currentIndex):0;setViewMode('focus');$('mainVideo').muted=true;$('mainVideo').autoplay=true;render();
       if(items.length){select(Math.min(current,items.length-1));$('status').textContent='已打开独立播放器；播放列表已释放，仅保留相邻视频切换。'}else $('status').textContent=d.playerError?.message||'找不到对应的本地文件，可能已移动或缺失。'
-    }else{$('status').textContent=(randomize?'本次已随机打开第 '+pageNo+' 页；封面由本地服务按需生成。':'本地源已就绪；封面由本地服务加载，播放状态会自动保存。');render();syncListUrl()}
+     }else{$('status').textContent=(randomize?'本次已随机打开第 '+pageNo+' 页；封面由本地服务按需生成。':'本地源已就绪；封面由本地服务加载，播放状态会自动保存。')+(playbackProfile==='remote'?' 当前为远程 480p 转码模式。':'');render();syncListUrl()}
   }catch(e){$('status').textContent='读取失败：'+e.message}finally{loading=false;initialLoad=false}
 }
 function setViewMode(mode){const focus=singleVideoMode||mode==='focus';$('layout').classList.toggle('focus-player',focus);const button=$('toggleView');button.textContent=singleVideoMode?'返回播放列表':(focus?'返回列表':'大播放视角');button.setAttribute('aria-pressed',String(focus));try{if(!singleVideoMode)localStorage.setItem('iwara-player-view',focus?'focus':'split')}catch{}}
 async function queueViews(){const r=await(await fetch('/api/enrich/queue-views',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})})).json();$('status').textContent='已加入 '+Number(r.queued||0)+' 条播放量同步任务'+(r.remaining?'，尚有 '+r.remaining+' 条待加入':'')+'；保持任一 Iwara 视频页打开即可逐步处理。'}
+async function refreshAllViews(){if(!confirm('将重新读取所有已下载视频的播放量，保持任一 Iwara 视频页打开即可处理。确认继续？'))return;const r=await(await fetch('/api/enrich/refresh-views',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})})).json();$('status').textContent='已加入 '+Number(r.queued||0)+' 条全部播放量更新任务'+(r.remaining?'，尚有 '+r.remaining+' 条待加入':'')+'；网页脚本将使用独立的 8 并发播放量队列。'}
+async function queueTags(){const r=await(await fetch('/api/enrich/queue-tags',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})})).json();$('status').textContent='已加入 '+Number(r.queued||0)+' 条标签同步任务'+(r.remaining?'，尚有 '+r.remaining+' 条待加入':'')+'；保持任一 Iwara 视频页打开即可逐步处理。'}
+async function refreshAllTags(){if(!confirm('将重新读取所有已下载视频的标签，保持任一 Iwara 视频页打开即可处理。确认继续？'))return;const r=await(await fetch('/api/enrich/refresh-tags',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({})})).json();$('status').textContent='已加入 '+Number(r.queued||0)+' 条全部标签更新任务'+(r.remaining?'，尚有 '+r.remaining+' 条待加入':'')+'；网页脚本将使用独立的元数据队列。'}
 function stripIdmPanels(root=document){for(const node of root.querySelectorAll?.('*')||[]){const marker=(node.id||'')+' '+(typeof node.className==='string'?node.className:'');if(/\bidm\b|internet-download-manager|download-manager/i.test(marker)&&node!==document.body&&node!==document.documentElement)node.remove()}}
-stripIdmPanels();new MutationObserver(mutations=>mutations.forEach(m=>m.addedNodes.forEach(n=>{if(n.nodeType===1){stripIdmPanels(n);const marker=(n.id||'')+' '+(typeof n.className==='string'?n.className:'');if(/\bidm\b|internet-download-manager|download-manager/i.test(marker))n.remove()}}))).observe(document.documentElement,{subtree:true,childList:true});
- $('toggleView').onclick=()=>{if(singleVideoMode){backToSource();return}const isFocus=$('layout').classList.contains('focus-player');setViewMode(isFocus?'split':'focus')};$('randomPage').onclick=()=>load(true,true);$('queueViews').onclick=queueViews;$('refresh').onclick=()=>load(true);$('loadMore').onclick=loadNextPage;$('query').oninput=()=>{clearTimeout(timer);timer=setTimeout(()=>load(true),250)};['sort','direction','watchedFilter'].forEach(id=>$(id).onchange=()=>load(true));$('mainVideo').onended=()=>{persistPlayback(true);if(current<items.length-1)select(current+1);else if(hasNext)navigateAdjacent(1)};$('mainVideo').ontimeupdate=schedulePlaybackSave;$('mainVideo').onpause=()=>persistPlayback(true);$('mainVideo').onerror=()=>{const task=items[current];if(task)void explainMediaFailure($('mainVideo'),task)};$('mainVideo').onloadeddata=()=>showPlayerError('');window.addEventListener('pagehide',()=>{sendPlaybackBeacon()},{once:true});window.addEventListener('beforeunload',sendPlaybackBeacon,{once:true});if(!singleVideoMode){$('query').value=routeParams.get('query')||'';$('sort').value=routeParams.get('sort')||'updatedAt';$('direction').value=routeParams.get('direction')||'desc';$('watchedFilter').value=routeParams.get('watched')||'all'}document.body.classList.toggle('single-mode',singleVideoMode);if(singleVideoMode){setViewMode('focus');if(pendingPlay)load(true,false);else{render();$('status').textContent='请从播放列表选择一个视频。'}}else{try{setViewMode(localStorage.getItem('iwara-player-view')||'split')}catch{setViewMode('split')}setupInfiniteScroll();load(true,!(routeParams.has('page')||routeParams.has('query')||routeParams.has('sort')||routeParams.has('direction')||routeParams.has('watched')))}
-</script></html>`;
+ function setPlaybackProfile(profile){playbackProfile=profile==='remote'?'remote':'local';const badge=$('qualityMode'),toggle=$('qualityToggle');if(badge){badge.textContent=playbackProfile==='remote'?'远程 480p':'局域网原画';badge.classList.toggle('remote',playbackProfile==='remote')}if(toggle){toggle.textContent=playbackProfile==='remote'?'切换原画':'切换远程480p';toggle.title=playbackProfile==='remote'?'切换回原始视频':'使用远程 480p 转码'}}
+ function togglePlaybackProfile(){const q=new URLSearchParams(location.search);q.set('profile',playbackProfile==='remote'?'local':'remote');location.href=location.pathname+'?'+q.toString()}
+ setPlaybackProfile(playbackProfile);$('qualityToggle').onclick=togglePlaybackProfile;stripIdmPanels();new MutationObserver(mutations=>mutations.forEach(m=>m.addedNodes.forEach(n=>{if(n.nodeType===1){stripIdmPanels(n);const marker=(n.id||'')+' '+(typeof n.className==='string'?n.className:'');if(/\bidm\b|internet-download-manager|download-manager/i.test(marker))n.remove()}}))).observe(document.documentElement,{subtree:true,childList:true});
+  $('toggleView').onclick=()=>{if(singleVideoMode){backToSource();return}const isFocus=$('layout').classList.contains('focus-player');setViewMode(isFocus?'split':'focus')};$('randomPage').onclick=()=>load(true,true);$('queueViews').onclick=queueViews;$('refresh').onclick=()=>load(true);$('loadMore').onclick=loadNextPage;$('selectAll').onclick=()=>{items.forEach(item=>selectedIds.add(item.id));render()};$('clearSelection').onclick=()=>{selectedIds.clear();render()};$('downloadSelected').onclick=downloadSelected;$('query').oninput=()=>{clearTimeout(timer);timer=setTimeout(()=>load(true),250)};['sort','direction','watchedFilter'].forEach(id=>$(id).onchange=()=>load(true));$('mainVideo').onended=()=>{persistPlayback(true);if(current<items.length-1)select(current+1);else if(hasNext)navigateAdjacent(1)};$('mainVideo').ontimeupdate=schedulePlaybackSave;$('mainVideo').onpause=()=>persistPlayback(true);$('mainVideo').onerror=()=>{const task=items[current];if(task)void explainMediaFailure($('mainVideo'),task)};$('mainVideo').onloadeddata=()=>showPlayerError('');window.addEventListener('pagehide',()=>{sendPlaybackBeacon()},{once:true});window.addEventListener('beforeunload',sendPlaybackBeacon,{once:true});if(!singleVideoMode){$('query').value=routeParams.get('query')||'';$('sort').value=routeParams.get('sort')||'updatedAt';$('direction').value=routeParams.get('direction')||'desc';$('watchedFilter').value=routeParams.get('watched')||'all'}document.body.classList.toggle('single-mode',singleVideoMode);if(singleVideoMode){setViewMode('focus');if(pendingPlay)load(true,false);else{render();$('status').textContent='请从播放列表选择一个视频。'}}else{try{setViewMode(localStorage.getItem('iwara-player-view')||'split')}catch{setViewMode('split')}setupInfiniteScroll();load(true,!(routeParams.has('page')||routeParams.has('query')||routeParams.has('sort')||routeParams.has('direction')||routeParams.has('watched')))}
+setPlaybackMode(playbackMode);$('playModeToggle').onclick=cyclePlaybackMode;$('refreshAllViews').onclick=refreshAllViews;$('mainVideo').onended=handlePlaybackEnded;const _selectWithAudio=select;select=(i,event,fromUser=false)=>{const result=_selectWithAudio(i,event,fromUser);$('mainVideo').muted=false;return result};$('mainVideo').addEventListener('loadedmetadata',()=>{$('mainVideo').muted=false});const _nativeVideoStyle=document.createElement('style');_nativeVideoStyle.textContent='.player video::-webkit-media-controls-panel,.player video::-webkit-media-controls-enclosure,.player video::-webkit-media-controls-overlay-enclosure{background:transparent!important;background-color:transparent!important;background-image:none!important}';document.head.append(_nativeVideoStyle);
+ $('query').addEventListener('input',renderTagCloud);void loadPopularTags();
+ if($('queueTags'))$('queueTags').onclick=queueTags;if($('refreshAllTags'))$('refreshAllTags').onclick=refreshAllTags;
+ void loadAuthorFilter();
+ </script></html>`;
 }
 
 const MEDIA_MIME_TYPES = new Map([
@@ -401,16 +544,20 @@ async function sendMultipartRanges(response, filePath, contentType, ranges, tota
   }
 }
 
-async function serveLocalMedia(request, response, scheduler, encodedId) {
+async function serveLocalMedia(request, response, scheduler, encodedId, transcodeCache = null, profile = "local", download = false) {
   try {
-    const media = await scheduler.mediaPath(decodeURIComponent(encodedId));
+    const taskId = decodeURIComponent(encodedId);
+    const media = normalizePlaybackProfile(profile) === "remote" && transcodeCache
+      ? await transcodeCache.get(taskId, scheduler)
+      : await scheduler.mediaPath(taskId);
     const info = await stat(media.path);
     const total = info.size;
     const baseHeaders = {
       "content-type": mediaContentType(media.path),
       "accept-ranges": "bytes",
       "cache-control": "private, max-age=3600",
-      "content-disposition": `inline; filename*=UTF-8''${encodeURIComponent(media.name)}`
+      "x-iwara-playback-profile": media.profile || "original",
+      "content-disposition": `${download ? "attachment" : "inline"}; filename*=UTF-8''${encodeURIComponent(media.name)}`
     };
     const range = request.headers.range;
     if (!range) {
@@ -449,7 +596,12 @@ async function serveLocalMedia(request, response, scheduler, encodedId) {
     if (request.method === "HEAD") return response.end();
     pipeMediaFile(response, media.path, { start, end: boundedEnd });
   } catch (error) {
-    sendJson(response, error.message === "本地视频不存在" || error.code === "ENOENT" ? 404 : 403, { error: error.message });
+    const status = error.message === "本地视频不存在" || error.code === "ENOENT"
+      ? 404
+      : error.code === "REMOTE_TRANSCODE_FAILED" || error.message.includes("远程转码") || error.message.includes("FFmpeg")
+        ? 503
+        : 403;
+    sendJson(response, status, { error: error.message });
   }
 }
 
@@ -469,7 +621,7 @@ async function serveLocalCover(request, response, scheduler, cache, encodedId) {
   }
 }
 
-export function createServer({ scheduler, host, port, accessToken = "", ffmpeg = null, onShutdown }) {
+export function createServer({ scheduler, host, port, accessToken = "", ffmpeg = null, transcodeCache = null, onShutdown }) {
   const coverCache = new CoverCache({ ffmpeg });
   const mediaDiagnostics = [];
   const server = http.createServer(async (request, response) => {
@@ -481,10 +633,11 @@ export function createServer({ scheduler, host, port, accessToken = "", ffmpeg =
         const remote = normalizeAddress(request.socket?.remoteAddress || "unknown");
         const range = String(request.headers.range || "-").slice(0, 120);
         const resourceId = url.pathname.startsWith("/media/") ? url.pathname.slice(7) : "";
+        const profile = requestPlaybackProfile(request, url);
         const startedAt = Date.now();
         const record = (status, aborted = false) => {
           if (!resourceId) return;
-          mediaDiagnostics.push({ taskId: resourceId, status, aborted, range, startedAt });
+          mediaDiagnostics.push({ taskId: resourceId, status, aborted, range, profile, startedAt });
           if (mediaDiagnostics.length > 200) mediaDiagnostics.shift();
         };
         let finished = false;
@@ -548,7 +701,7 @@ export function createServer({ scheduler, host, port, accessToken = "", ffmpeg =
           "x-content-type-options": "nosniff",
           "x-frame-options": "DENY",
           "referrer-policy": "no-referrer",
-          "content-security-policy": "default-src 'self'; media-src 'self' blob:; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; object-src 'none'; frame-src 'none'"
+          "content-security-policy": "default-src 'self'; media-src 'self' blob:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; object-src 'none'; frame-src 'none'"
         });
         response.end(body);
       } else if (request.method === "GET" && ["/player", "/playlist", "/playlist.html"].includes(url.pathname)) {
@@ -559,11 +712,11 @@ export function createServer({ scheduler, host, port, accessToken = "", ffmpeg =
           "x-content-type-options": "nosniff",
           "x-frame-options": "DENY",
           "referrer-policy": "no-referrer",
-          "content-security-policy": "default-src 'self'; media-src 'self' blob:; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; object-src 'none'; frame-src 'none'"
+          "content-security-policy": "default-src 'self'; media-src 'self' blob:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; object-src 'none'; frame-src 'none'"
         });
         response.end(body);
       } else if ((request.method === "GET" || request.method === "HEAD") && url.pathname.startsWith("/media/")) {
-        await serveLocalMedia(request, response, scheduler, url.pathname.slice("/media/".length));
+        await serveLocalMedia(request, response, scheduler, url.pathname.slice("/media/".length), transcodeCache, requestPlaybackProfile(request, url), url.searchParams.get("download") === "1");
       } else if ((request.method === "GET" || request.method === "HEAD") && url.pathname.startsWith("/cover/")) {
         await serveLocalCover(request, response, scheduler, coverCache, url.pathname.slice("/cover/".length));
       } else if (request.method === "GET" && ["/api/playlist", "/playlist-data"].includes(url.pathname)) {
@@ -590,13 +743,33 @@ export function createServer({ scheduler, host, port, accessToken = "", ffmpeg =
           page: Number(url.searchParams.get("page") || 1),
           pageSize: Number(url.searchParams.get("pageSize") || 25),
           randomPage: ["1", "true", "yes"].includes(String(url.searchParams.get("randomPage") || "").toLowerCase())
-        }), accessToken));
+        }), accessToken, requestPlaybackProfile(request, url)));
+      } else if (request.method === "GET" && url.pathname === "/api/playlist-tags") {
+        reply(200, { tags: typeof scheduler.playlistTags === "function"
+          ? scheduler.playlistTags({ limit: Number(url.searchParams.get("limit") || 18) })
+          : [] });
       } else if (request.method === "POST" && url.pathname === "/api/views") {
         const body = await readJson(request);
         reply(200, await scheduler.updateViewCount(body.videoId, body.views));
       } else if (request.method === "POST" && url.pathname.startsWith("/api/playback/")) {
         const taskId = decodeURIComponent(url.pathname.slice("/api/playback/".length));
         reply(200, await scheduler.updatePlayback(taskId, await readJson(request)));
+      } else if ((request.method === "GET" || request.method === "HEAD") && url.pathname.startsWith("/assets/plyr/")) {
+        const assetName = url.pathname.slice("/assets/plyr/".length);
+        const assetFiles = {
+          "plyr.css": { path: path.resolve(import.meta.dirname, "vendor", "plyr", "plyr.css"), type: "text/css; charset=utf-8" },
+          "plyr.polyfilled.min.js": { path: path.resolve(import.meta.dirname, "vendor", "plyr", "plyr.polyfilled.min.js"), type: "application/javascript; charset=utf-8" },
+          "plyr.svg": { path: path.resolve(import.meta.dirname, "vendor", "plyr", "plyr.svg"), type: "image/svg+xml" }
+        }[assetName];
+        if (!assetFiles) { reply(404, { error: "asset not found" }); return; }
+        const body = await readFile(assetFiles.path);
+        response.writeHead(200, {
+          "content-type": assetFiles.type,
+          "content-length": body.length,
+          "cache-control": "public, max-age=86400",
+          "x-content-type-options": "nosniff"
+        });
+        if (request.method === "GET") response.end(body); else response.end();
       } else if (request.method === "GET" && url.pathname === "/IwaraResilientQueue.user.js") {
         const body = await readFile(path.resolve(import.meta.dirname, "..", "IwaraResilientQueue.user.js"));
         response.writeHead(200, {
@@ -610,10 +783,12 @@ export function createServer({ scheduler, host, port, accessToken = "", ffmpeg =
       } else if (request.method === "GET" && url.pathname === "/api/lan-info") {
         const token = String(accessToken || "").trim();
         const encodedToken = encodeURIComponent(token);
-        const urls = token
-          ? localLanAddresses().map(address => `http://${address}:${port}/playlist?access_token=${encodedToken}`)
-          : [];
-        reply(200, { enabled: Boolean(token), urls, host, port });
+        const addresses = token ? localLanAddresses() : [];
+        const urls = addresses.filter(address => !isTailscaleAddress(address))
+          .map(address => `http://${address}:${port}/playlist?access_token=${encodedToken}`);
+        const remoteUrls = addresses.filter(isTailscaleAddress)
+          .map(address => `http://${address}:${port}/playlist?profile=remote&access_token=${encodedToken}`);
+        reply(200, { enabled: Boolean(token), urls, remoteUrls, host, port });
       } else if (request.method === "GET" && url.pathname.startsWith("/api/media-diagnostics/")) {
         const taskId = decodeURIComponent(url.pathname.slice("/api/media-diagnostics/".length));
         const since = Number(url.searchParams.get("since") || 0);
@@ -651,6 +826,10 @@ export function createServer({ scheduler, host, port, accessToken = "", ffmpeg =
         reply(200, await scheduler.submitResolution(await readJson(request)));
       } else if (request.method === "GET" && url.pathname === "/api/enrich/next") {
         reply(200, { task: await scheduler.leaseMetadataEnrichment() });
+      } else if (request.method === "GET" && url.pathname === "/api/enrich/next-views") {
+        reply(200, { task: await scheduler.leaseMetadataEnrichment({ viewsOnly: true }) });
+      } else if (request.method === "GET" && url.pathname === "/api/enrich/next-tags") {
+        reply(200, { task: await scheduler.leaseMetadataEnrichment({ tagsOnly: true }) });
       } else if (request.method === "POST" && url.pathname === "/api/enrich/result") {
         reply(200, await scheduler.submitMetadataEnrichment(await readJson(request)));
       } else if (request.method === "POST" && url.pathname === "/api/enrich/retry-failed") {
@@ -658,6 +837,15 @@ export function createServer({ scheduler, host, port, accessToken = "", ffmpeg =
       } else if (request.method === "POST" && url.pathname === "/api/enrich/queue-views") {
         const body = await readJson(request);
         reply(200, await scheduler.queueViewCountEnrichment(body.limit));
+      } else if (request.method === "POST" && url.pathname === "/api/enrich/refresh-views") {
+        const body = await readJson(request);
+        reply(200, await scheduler.refreshViewCountEnrichment(body.limit));
+      } else if (request.method === "POST" && url.pathname === "/api/enrich/queue-tags") {
+        const body = await readJson(request);
+        reply(200, await scheduler.queueTagEnrichment(body.limit));
+      } else if (request.method === "POST" && url.pathname === "/api/enrich/refresh-tags") {
+        const body = await readJson(request);
+        reply(200, await scheduler.refreshTagEnrichment(body.limit));
       } else if (request.method === "POST" && url.pathname.startsWith("/api/retry/")) {
         reply(200, await scheduler.retryTask(url.pathname.split("/").pop()));
       } else if (request.method === "POST" && url.pathname.startsWith("/api/redownload/")) {
@@ -682,6 +870,6 @@ export function createServer({ scheduler, host, port, accessToken = "", ffmpeg =
       server.once("error", reject);
       server.listen(port, host, resolve);
     }),
-    close: () => { coverCache.clear(); return new Promise(resolve => server.close(resolve)); }
+    close: () => { coverCache.clear(); transcodeCache?.close(); return new Promise(resolve => server.close(resolve)); }
   };
 }

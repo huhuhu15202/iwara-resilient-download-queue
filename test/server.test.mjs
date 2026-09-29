@@ -87,6 +87,52 @@ test("LAN info endpoint is available on the local service", async () => {
   }
 });
 
+test("view refresh endpoints expose the manual bulk update flow", async () => {
+  const calls = [];
+  const scheduler = {
+    status: () => ({ ok: true }),
+    async refreshViewCountEnrichment(limit) { calls.push(["refresh", limit]); return { queued: 12, remaining: 0 }; },
+    async leaseMetadataEnrichment(options) { calls.push(["lease", options]); return { taskId: "task-view" }; }
+  };
+  const service = createServer({ scheduler, host: "127.0.0.1", port: 0, onShutdown: () => {} });
+  await service.listen();
+  const port = service.server.address().port;
+  try {
+    const refresh = await request(port, "/api/enrich/refresh-views", {}, "POST");
+    assert.equal(refresh.status, 200);
+    assert.equal(JSON.parse(refresh.body).queued, 12);
+    const next = await request(port, "/api/enrich/next-views");
+    assert.equal(next.status, 200);
+    assert.equal(JSON.parse(next.body).task.taskId, "task-view");
+    assert.deepEqual(calls, [["refresh", undefined], ["lease", { viewsOnly: true }]]);
+  } finally {
+    await service.close();
+  }
+});
+
+test("tag refresh endpoints expose the manual tag update flow", async () => {
+  const calls = [];
+  const scheduler = {
+    status: () => ({ ok: true }),
+    async refreshTagEnrichment(limit) { calls.push(["refresh-tags", limit]); return { queued: 8, remaining: 2 }; },
+    async leaseMetadataEnrichment(options) { calls.push(["lease", options]); return { taskId: "task-tags" }; }
+  };
+  const service = createServer({ scheduler, host: "127.0.0.1", port: 0, onShutdown: () => {} });
+  await service.listen();
+  const port = service.server.address().port;
+  try {
+    const refresh = await request(port, "/api/enrich/refresh-tags", {}, "POST");
+    assert.equal(refresh.status, 200);
+    assert.equal(JSON.parse(refresh.body).queued, 8);
+    const next = await request(port, "/api/enrich/next-tags");
+    assert.equal(next.status, 200);
+    assert.equal(JSON.parse(next.body).task.taskId, "task-tags");
+    assert.deepEqual(calls, [["refresh-tags", undefined], ["lease", { tagsOnly: true }]]);
+  } finally {
+    await service.close();
+  }
+});
+
 test("playlist resource URLs and media ranges work without changing the stored video", async () => {
   const temp = await mkdtemp(path.join(tmpdir(), "iwara-media-range-"));
   const filePath = path.join(temp, "sample.mp4");
@@ -109,6 +155,7 @@ test("playlist resource URLs and media ranges work without changing the stored v
     assert.equal(list.status, 200);
     const item = JSON.parse(list.body).items[0];
     assert.match(item.streamUrl, /^\/media\/video-a\?ticket=/);
+    assert.match(item.downloadUrl, /^\/media\/video-a\?ticket=.*[&]download=1/);
     assert.match(item.coverUrl, /^\/cover\/video-a\?ticket=/);
     assert.equal(item.streamUrl.includes("secret"), false);
     const page = await request(port, "/playlist");
@@ -118,7 +165,32 @@ test("playlist resource URLs and media ranges work without changing the stored v
     assert.doesNotThrow(() => new Script(script));
     assert.match(page.body, /id="loadSentinel"/);
     assert.match(page.body, /IntersectionObserver/);
+    assert.match(page.body, /id="qualityToggle"/);
+    assert.match(page.body, /setPlaybackProfile/);
+    assert.match(page.body, /id="pageInfo"/);
+    assert.match(page.body, /id="playModeToggle"/);
+    assert.match(page.body, /id="card-select"|class="card-select"/);
+    assert.match(page.body, /id="downloadSelected"/);
+    assert.match(page.body, /downloadUrl/);
+    assert.match(page.body, /handlePlaybackEnded/);
+    assert.doesNotMatch(page.body, /plyr\.polyfilled\.min\.js/);
+    assert.match(page.body, /<video id="mainVideo" controls playsinline/);
+    assert.match(page.body, /Plyr integration intentionally disabled/);
+    assert.match(page.body, /window\.__iwaraSetPage/);
+    assert.match(page.body, /iwara-page-jump/);
+    assert.match(page.body, /webkit-media-controls-panel/);
     assert.match(page.body, /@media\(max-width:600px\)\{header\{position:relative/);
+    const plyrCss = await request(port, "/assets/plyr/plyr.css");
+    assert.equal(plyrCss.status, 200);
+    assert.match(plyrCss.headers["content-type"], /^text\/css/);
+    assert.match(plyrCss.body, /\.plyr/);
+    const plyrJs = await request(port, "/assets/plyr/plyr.polyfilled.min.js");
+    assert.equal(plyrJs.status, 200);
+    assert.match(plyrJs.headers["content-type"], /^application\/javascript/);
+    assert.match(plyrJs.body, /Plyr/);
+    const plyrSvg = await request(port, "/assets/plyr/plyr.svg");
+    assert.equal(plyrSvg.status, 200);
+    assert.match(plyrSvg.headers["content-type"], /^image\/svg\+xml/);
     const head = await request(port, item.streamUrl, { range: "bytes=100-" }, "HEAD");
     assert.equal(head.status, 206);
     assert.equal(head.headers["content-range"], "bytes 100-8191/8192");
@@ -126,6 +198,9 @@ test("playlist resource URLs and media ranges work without changing the stored v
     const open = await request(port, item.streamUrl, { range: "bytes=100-" });
     assert.equal(open.status, 206);
     assert.equal(open.raw.length, 8092);
+    const download = await request(port, item.downloadUrl, { range: "bytes=0-3" });
+    assert.equal(download.status, 206);
+    assert.match(download.headers["content-disposition"], /^attachment;/);
     const suffix = await request(port, item.streamUrl, { range: "bytes=-200" });
     assert.equal(suffix.status, 206);
     assert.equal(suffix.raw.length, 200);
@@ -143,6 +218,36 @@ test("playlist resource URLs and media ranges work without changing the stored v
     const diagnostics = await request(port, "/api/media-diagnostics/video-a?since=0");
     assert.equal(diagnostics.status, 200);
     assert.equal(JSON.parse(diagnostics.body).events.at(-1).status, 416);
+    const remoteService = createServer({
+      scheduler,
+      host: "127.0.0.1",
+      port: 0,
+      accessToken: "secret",
+      transcodeCache: {
+        get: async () => ({ path: filePath, name: "sample.480p.mp4" }),
+        close: () => {}
+      },
+      onShutdown: () => {}
+    });
+    await remoteService.listen();
+    const remotePort = remoteService.server.address().port;
+    const remoteList = await request(remotePort, "/playlist-data?profile=remote&pageSize=30");
+    const remotePayload = JSON.parse(remoteList.body);
+    assert.equal(remotePayload.playbackProfile, "remote");
+    const remoteItem = remotePayload.items[0];
+    assert.equal(remoteItem.playbackProfile, "remote");
+    assert.match(remoteItem.streamUrl, /[?&]profile=remote(?:&|$)/);
+    const tailscaleList = await request(remotePort, "/playlist-data?pageSize=30", { host: `100.114.82.98:${remotePort}` });
+    assert.equal(JSON.parse(tailscaleList.body).items[0].playbackProfile, "remote");
+    const explicitLocalList = await request(remotePort, "/playlist-data?profile=local&pageSize=30", { host: `100.114.82.98:${remotePort}` });
+    const explicitLocalPayload = JSON.parse(explicitLocalList.body);
+    assert.equal(explicitLocalPayload.playbackProfile, "local");
+    assert.equal(explicitLocalPayload.items[0].playbackProfile, "local");
+    assert.match(explicitLocalPayload.items[0].streamUrl, /[?&]profile=local(?:&|$)/);
+    const remoteRange = await request(remotePort, remoteItem.streamUrl, { range: "bytes=0-99" });
+    assert.equal(remoteRange.status, 206);
+    assert.match(remoteRange.headers["content-disposition"], /sample\.480p\.mp4/);
+    await remoteService.close();
     await rm(filePath);
     assert.equal((await request(port, item.streamUrl)).status, 404);
     assert.equal((await request(port, item.coverUrl)).status, 404);
