@@ -1,5 +1,5 @@
 import {
-  access, copyFile, mkdir, open, readFile, rename, rm, stat, unlink
+  access, copyFile, mkdir, open, readFile, readdir, rename, rm, stat, unlink
 } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -29,8 +29,61 @@ function safeFolderName(value) {
   return cleaned;
 }
 
+function normalizeTags(value) {
+  if (!Array.isArray(value)) return [];
+  const result = [];
+  const seen = new Set();
+  for (const item of value) {
+    const tag = typeof item === "string"
+      ? item
+      : (item?.name ?? item?.title ?? item?.label ?? item?.id ?? "");
+    const text = String(tag || "").trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    result.push(text);
+  }
+  return result;
+}
+
+function readTagField(metadata = {}) {
+  if (!metadata || typeof metadata !== "object") return { present: false, value: undefined };
+  if (metadata.tagsFieldPresent === false) return { present: false, value: undefined };
+  const candidates = [
+    ["tags", metadata.tags],
+    ["Tags", metadata.Tags],
+    ["data.tags", metadata.data?.tags],
+    ["video.tags", metadata.video?.tags],
+    ["metadata.tags", metadata.metadata?.tags],
+    ["RAW.tags", metadata.RAW?.tags]
+  ];
+  const found = candidates.find(([, value]) => Array.isArray(value));
+  return found ? { present: true, path: found[0], value: found[1] } : { present: false, value: undefined };
+}
+
+function hasTagField(metadata = {}) {
+  return readTagField(metadata).present;
+}
+
+function metadataTags(metadata = {}) {
+  return readTagField(metadata).value;
+}
+
+function taskNeedsTags(task) {
+  return task.tagsRequested === true;
+}
+
+function taskNeedsViews(task) {
+  return task.viewCountRequested === true && task.viewCount == null;
+}
+
+function taskNeedsBaseMetadata(task, importedMetadataEnrichmentEnabled = true) {
+  if (task?.imported && importedMetadataEnrichmentEnabled === false) return false;
+  return !task?.author || !task?.uploadTime;
+}
+
 function publicTask(task) {
   const { resolved, leaseId, metadataLeaseId, stagingFile, gid, ...safe } = task;
+  safe.tags = normalizeTags(safe.tags);
   return safe;
 }
 
@@ -186,6 +239,8 @@ export class Scheduler {
     this.reconcileTimer = null;
     this.reconcileCursor = 0;
     this.busy = false;
+    this.mediaIndex = null;
+    this.mediaIndexPromise = null;
   }
 
   async init() {
@@ -203,6 +258,24 @@ export class Scheduler {
       task.browserFallbackPending ??= false;
       task.browserFallbackAttempted ??= false;
       task.downloadEngine ??= task.gid ? "aria2" : null;
+      task.tagsRequested ??= false;
+      task.tagsRequestedExplicitly ??= false;
+      if (Array.isArray(task.tags)) task.tags = normalizeTags(task.tags);
+      // Older builds automatically set tagsRequested for every imported file.
+      // That was indistinguishable from a user-requested tag refresh and made
+      // a file move look like a remote metadata job.  Migrate only those
+      // legacy automatic requests; future manual requests carry an explicit
+      // marker and are preserved across restarts.
+      if (task.imported && task.tagsRequested && !task.tagsRequestedExplicitly) {
+        task.tagsRequested = false;
+        task.metadataLeaseId = null;
+        task.metadataLeaseExpiresAt = null;
+        task.metadataNextRunAt = 0;
+        if (!task.viewCountRequested && !taskNeedsBaseMetadata(task, this.importedMetadataEnrichmentEnabled())) {
+          task.metadataStatus = "complete";
+          task.metadataMessage = "已重建本地文件引导，未自动获取 Iwara 资料；需要时请手动同步标签";
+        }
+      }
       if (task.classificationMove) {
         const { source, destination, folder } = task.classificationMove;
         const [sourceInfo, destinationInfo] = await Promise.all([
@@ -233,43 +306,40 @@ export class Scheduler {
           task.alias ||= metadata.Alias || "";
           task.uploadTime ||= metadata.UploadTime || null;
           task.viewCount ??= metadata.Views ?? metadata.viewCount ?? metadata.views ?? null;
+          if (Object.prototype.hasOwnProperty.call(metadata, "Tags") || Object.prototype.hasOwnProperty.call(metadata, "tags")) {
+            task.tags = normalizeTags(metadata.Tags ?? metadata.tags);
+            task.tagsUpdatedAt ||= nowIso();
+          }
         } catch {
           // Older records may not have a sidecar metadata file.
         }
       }
-      if (task.imported || task.viewCountRequested) {
-        // A view-count sync is an explicit queue request.  Keep it pending
-        // across service restarts even when author/date are already present.
-        if (task.viewCountRequested && task.viewCount == null && task.metadataStatus === "failed") {
-          // Preserve a terminal view-sync failure for the ledger/report.
-          task.metadataMessage ||= "播放量同步失败；保留原文件和记录";
-        } else if (task.viewCountRequested && task.viewCount == null && ["pending", "retry", "enriching"].includes(task.metadataStatus)) {
-          if (task.metadataStatus === "enriching") {
-            task.metadataStatus = "pending";
-            task.metadataLeaseId = null;
-            task.metadataLeaseExpiresAt = null;
-            task.metadataNextRunAt = 0;
-            task.metadataMessage = "服务重启，等待同步播放量";
-          }
-        } else if (task.viewCountRequested && task.viewCount == null && task.metadataStatus === "complete") {
-          // Older service versions could clear the failed state on restart.
-          // A requested sync with no view count is not a successful sync.
-          task.metadataStatus = "failed";
-          task.metadataMessage = "播放量接口未找到该视频；保留原文件和记录";
-        } else if (task.author && task.uploadTime) {
-          task.metadataStatus = "complete";
-          task.metadataMessage = task.viewCount == null ? "作者和上传日期已齐全" : "作者、日期和播放量已齐全";
-        } else if (task.metadataStatus === "enriching") {
+      if (task.imported || task.viewCountRequested || task.tagsRequested) {
+        const needsBase = taskNeedsBaseMetadata(task, this.importedMetadataEnrichmentEnabled());
+        const needsViews = taskNeedsViews(task);
+        const needsTags = taskNeedsTags(task);
+        const hasPendingRequirement = needsBase || needsViews || needsTags;
+        if (task.metadataStatus === "enriching") {
           task.metadataStatus = "pending";
           task.metadataLeaseId = null;
           task.metadataLeaseExpiresAt = null;
           task.metadataNextRunAt = 0;
-          task.metadataMessage = "服务重启，等待重新补齐";
+          task.metadataMessage = "服务重启，等待重新补齐作者、日期、播放量和标签";
+        } else if (task.metadataStatus === "complete" && hasPendingRequirement) {
+          task.metadataStatus = "pending";
+          task.metadataNextRunAt = 0;
+          task.metadataMessage = "等待补齐未完成的元数据";
         } else if (!task.metadataStatus) {
           task.metadataStatus = "pending";
           task.metadataAttempts = 0;
           task.metadataNextRunAt = 0;
-          task.metadataMessage = "等待补齐作者和上传日期";
+          task.metadataMessage = "等待补齐作者、上传日期和标签";
+        } else if (!hasPendingRequirement && task.imported && !this.importedMetadataEnrichmentEnabled()) {
+          task.metadataStatus = "complete";
+          task.metadataMessage = "已重建本地文件引导，未自动获取 Iwara 资料；需要时请手动同步标签";
+        } else if (task.metadataStatus !== "failed" && !hasPendingRequirement) {
+          task.metadataStatus = "complete";
+          task.metadataMessage = "作者、日期、播放量和标签已齐全";
         }
         task.metadataLeaseId ||= null;
         task.metadataLeaseExpiresAt ||= null;
@@ -371,10 +441,29 @@ export class Scheduler {
     return Math.max(1, Number(this.config.maxConcurrentTasks || 1));
   }
 
-  activeTaskCount() {
+  maxConcurrentMetadataTasks() {
+    return Math.max(1, Number(this.config.maxConcurrentMetadataTasks ?? this.maxConcurrentTasks()));
+  }
+
+  importedMetadataEnrichmentEnabled() {
+    // Keep direct Scheduler test fixtures and older configs backwards
+    // compatible; production defaults explicitly disable this noisy legacy
+    // pass for imported files.
+    return this.config.importedMetadataEnrichmentEnabled !== false;
+  }
+
+  activeDownloadCount() {
     return this.store.state.tasks.filter(task =>
       ["resolving", "downloading", "finalizing"].includes(task.state)
-    ).length + this.store.state.tasks.filter(task => task.metadataStatus === "enriching").length;
+    ).length;
+  }
+
+  activeMetadataCount() {
+    return this.store.state.tasks.filter(task => task.metadataStatus === "enriching").length;
+  }
+
+  activeTaskCount() {
+    return this.activeDownloadCount() + this.activeMetadataCount();
   }
 
   async enqueue(items) {
@@ -420,7 +509,9 @@ export class Scheduler {
   }
 
   async leaseNext() {
-    if (this.activeTaskCount() >= this.maxConcurrentTasks()) return null;
+    // Metadata enrichment has its own pool and must never consume a download
+    // slot. This keeps three actual downloads running whenever work exists.
+    if (this.activeDownloadCount() >= this.maxConcurrentTasks()) return null;
     const now = this.clock.now();
     const task = this.store.state.tasks.find(
       item => item.state === "queued" && (item.nextRunAt || 0) <= now
@@ -530,6 +621,10 @@ export class Scheduler {
     task.alias = video.metadata?.Alias || task.alias || "";
     task.uploadTime = video.metadata?.UploadTime || task.uploadTime || null;
     task.viewCount ??= video.metadata?.Views ?? video.metadata?.viewCount ?? video.metadata?.views ?? null;
+    if (video.metadata && hasTagField(video.metadata)) {
+      task.tags = normalizeTags(metadataTags(video.metadata));
+      task.tagsUpdatedAt = nowIso();
+    }
     const requestedFile = video.fileName || video.relativePath || task.preferredRelativePath || `${task.videoId}.mp4`;
     const forwardHeaders = sanitizeForwardHeaders(video.headers || {});
     if (video.referer && !forwardHeaders.Referer) forwardHeaders.Referer = video.referer;
@@ -610,16 +705,21 @@ export class Scheduler {
     }
   }
 
-  async leaseMetadataEnrichment() {
+  async leaseMetadataEnrichment({ viewsOnly = false, tagsOnly = false } = {}) {
     const now = this.clock.now();
-    if (this.activeTaskCount() >= this.maxConcurrentTasks()) return null;
+    if (this.activeMetadataCount() >= this.maxConcurrentMetadataTasks()) return null;
     const waitingDownload = this.store.state.tasks.some(item =>
       item.state === "queued" && (item.nextRunAt || 0) <= now
     );
     if (waitingDownload) return null;
+    const importedMetadataEnrichmentEnabled = this.importedMetadataEnrichmentEnabled();
     const task = this.store.state.tasks.find(item =>
-      item.state === "completed" && item.destination && (item.imported || item.viewCountRequested) &&
-      ((!item.author || !item.uploadTime) || (item.viewCountRequested && item.viewCount == null)) &&
+      item.state === "completed" && item.destination &&
+      (tagsOnly
+        ? item.tagsRequested === true
+        : viewsOnly
+          ? item.viewCountRequested === true
+          : (taskNeedsBaseMetadata(item, importedMetadataEnrichmentEnabled) || taskNeedsViews(item) || taskNeedsTags(item))) &&
       ["pending", "retry"].includes(item.metadataStatus) &&
       (item.metadataNextRunAt || 0) <= now
     );
@@ -634,7 +734,9 @@ export class Scheduler {
       taskId: task.id,
       leaseId: task.metadataLeaseId,
       videoId: task.videoId,
-      attempt: (task.metadataAttempts || 0) + 1
+      attempt: (task.metadataAttempts || 0) + 1,
+      tagsOnly: Boolean(tagsOnly),
+      viewsOnly: Boolean(viewsOnly)
     };
   }
 
@@ -651,27 +753,50 @@ export class Scheduler {
     task.updatedAt = nowIso();
     if (ok && metadata) {
       const requestedViews = task.viewCountRequested === true;
+      const requestedTags = task.tagsRequested === true;
       task.title = metadata.title || task.title || task.videoId;
       task.author = metadata.author || task.author || "";
       task.alias = metadata.alias || task.alias || "";
       task.uploadTime = metadata.uploadTime || task.uploadTime || null;
+      const baseMetadataNeeded = taskNeedsBaseMetadata(task, this.importedMetadataEnrichmentEnabled());
       const fetchedViews = metadata.views ?? metadata.viewCount ?? metadata.Views ?? null;
+      let fetchedValidViews = false;
       if (fetchedViews != null) {
         const views = Number(fetchedViews);
         if (Number.isSafeInteger(views) && views >= 0) {
           task.viewCount = views;
           task.viewsUpdatedAt = nowIso();
+          fetchedValidViews = true;
         }
       }
-      if (requestedViews) task.viewCountRequested = false;
-      if (!task.author || !task.uploadTime) {
+      if (requestedViews && fetchedValidViews) task.viewCountRequested = false;
+      if (hasTagField(metadata)) {
+        task.tags = normalizeTags(metadataTags(metadata));
+        task.tagsUpdatedAt = nowIso();
+        if (requestedTags) task.tagsRequested = false;
+      }
+      if (requestedTags && !hasTagField(metadata)) {
+        ok = false;
+        error = "Iwara 返回的数据缺少标签字段";
+      } else if (baseMetadataNeeded) {
         ok = false;
         error = "Iwara 返回的数据缺少作者或上传日期";
       } else {
-        task.metadataStatus = "complete";
-        task.metadataMessage = requestedViews
-          ? (task.viewCount == null ? "作者和日期已补齐；Iwara 未返回播放量" : "作者、日期和播放量已补齐")
-          : "作者和上传日期已补齐";
+        const remaining = [];
+        if (baseMetadataNeeded) remaining.push("作者和日期");
+        if (taskNeedsViews(task)) remaining.push("播放量");
+        if (taskNeedsTags(task)) remaining.push("标签");
+        if (remaining.length) {
+          task.metadataStatus = "pending";
+          task.metadataNextRunAt = 0;
+          task.metadataMessage = `${baseMetadataNeeded ? "作者和日期已更新；" : ""}等待${remaining.join("、")}`;
+        } else {
+          task.metadataStatus = "complete";
+          const completedParts = baseMetadataNeeded ? ["作者和日期"] : [];
+          if (fetchedValidViews || (!requestedViews && task.viewCount != null)) completedParts.push("播放量");
+          if (hasTagField(metadata) || (!requestedTags && task.tagsUpdatedAt)) completedParts.push("标签");
+          task.metadataMessage = `${completedParts.length ? completedParts.join("、") : "元数据"}已齐全`;
+        }
         await this.store.save();
         return publicTask(task);
       }
@@ -694,7 +819,8 @@ export class Scheduler {
   async retryFailedMetadata() {
     let count = 0;
     for (const task of this.store.state.tasks) {
-      if ((task.imported || task.viewCountRequested) && task.metadataStatus === "failed" && ((!task.author || !task.uploadTime) || task.viewCountRequested)) {
+      if ((taskNeedsBaseMetadata(task, this.importedMetadataEnrichmentEnabled()) || task.viewCountRequested || task.tagsRequested) && task.metadataStatus === "failed") {
+        if (task.tagsRequested) task.tagsRequestedExplicitly = true;
         task.metadataStatus = "pending";
         task.metadataAttempts = 0;
         task.metadataNextRunAt = 0;
@@ -722,6 +848,69 @@ export class Scheduler {
       task.metadataLeaseId = null;
       task.metadataLeaseExpiresAt = null;
       task.metadataMessage = "等待同步播放量";
+      task.updatedAt = nowIso();
+    }
+    await this.store.save();
+    return { queued: selected.length, remaining: Math.max(0, candidates.length - selected.length) };
+  }
+
+  async refreshViewCountEnrichment(limit = 0) {
+    const max = Math.min(5000, Math.max(0, Number(limit) || 0));
+    const candidates = this.store.state.tasks
+      .filter(task => task.state === "completed" && task.destination && task.metadataStatus !== "enriching")
+      .sort((a, b) => String(a.updatedAt || a.completedAt || a.id).localeCompare(String(b.updatedAt || b.completedAt || b.id)));
+    const selected = max ? candidates.slice(0, max) : candidates;
+    for (const task of selected) {
+      task.viewCountRequested = true;
+      task.metadataStatus = "pending";
+      task.metadataAttempts = 0;
+      task.metadataNextRunAt = 0;
+      task.metadataLeaseId = null;
+      task.metadataLeaseExpiresAt = null;
+      task.metadataMessage = "等待重新同步播放量";
+      task.updatedAt = nowIso();
+    }
+    await this.store.save();
+    return { queued: selected.length, remaining: Math.max(0, candidates.length - selected.length) };
+  }
+
+  async queueTagEnrichment(limit = 0) {
+    const max = Math.min(5000, Math.max(0, Number(limit) || 0));
+    const candidates = this.store.state.tasks
+      .filter(task => task.state === "completed" && task.destination && !task.tagsUpdatedAt &&
+        task.metadataStatus !== "enriching")
+      .sort((a, b) => String(a.updatedAt || a.completedAt || a.id).localeCompare(String(b.updatedAt || b.completedAt || b.id)));
+    const selected = max ? candidates.slice(0, max) : candidates;
+    for (const task of selected) {
+      task.tagsRequested = true;
+      task.tagsRequestedExplicitly = true;
+      task.metadataStatus = "pending";
+      task.metadataAttempts = 0;
+      task.metadataNextRunAt = 0;
+      task.metadataLeaseId = null;
+      task.metadataLeaseExpiresAt = null;
+      task.metadataMessage = "等待同步标签";
+      task.updatedAt = nowIso();
+    }
+    await this.store.save();
+    return { queued: selected.length, remaining: Math.max(0, candidates.length - selected.length) };
+  }
+
+  async refreshTagEnrichment(limit = 0) {
+    const max = Math.min(5000, Math.max(0, Number(limit) || 0));
+    const candidates = this.store.state.tasks
+      .filter(task => task.state === "completed" && task.destination && task.metadataStatus !== "enriching")
+      .sort((a, b) => String(a.updatedAt || a.completedAt || a.id).localeCompare(String(b.updatedAt || b.completedAt || b.id)));
+    const selected = max ? candidates.slice(0, max) : candidates;
+    for (const task of selected) {
+      task.tagsRequested = true;
+      task.tagsRequestedExplicitly = true;
+      task.metadataStatus = "pending";
+      task.metadataAttempts = 0;
+      task.metadataNextRunAt = 0;
+      task.metadataLeaseId = null;
+      task.metadataLeaseExpiresAt = null;
+      task.metadataMessage = "等待重新同步标签";
       task.updatedAt = nowIso();
     }
     await this.store.save();
@@ -1022,6 +1211,9 @@ export class Scheduler {
 
   async verifyFiles() {
     let present = 0, missing = 0, sizeMismatch = 0;
+    // A manual verification is also the explicit signal that files may have
+    // been moved or renamed since the last scan.
+    this.mediaIndex = null;
     for (const task of this.store.state.tasks.filter(item => item.state === "completed")) {
       await this.verifyCompletedTask(task);
       if (task.fileStatus === "present") present += 1;
@@ -1200,9 +1392,14 @@ export class Scheduler {
 
   status() {
     const tasks = this.store.state.tasks.map(publicTask);
+    const importedMetadataEnrichmentEnabled = this.importedMetadataEnrichmentEnabled();
+    const metadataTasks = tasks.filter(task =>
+      taskNeedsBaseMetadata(task, importedMetadataEnrichmentEnabled) ||
+      task.viewCountRequested || task.tagsRequested
+    );
     const metadataCounts = Object.fromEntries(
       ["pending", "retry", "enriching", "complete", "failed"]
-        .map(state => [state, tasks.filter(task => task.metadataStatus === state).length])
+        .map(state => [state, metadataTasks.filter(task => task.metadataStatus === state).length])
     );
     const completedTasks = tasks.filter(task => task.state === "completed");
     const viewCounts = {
@@ -1210,6 +1407,12 @@ export class Scheduler {
       pending: completedTasks.filter(task => task.viewCount == null && task.viewCountRequested && ["pending", "retry", "enriching"].includes(task.metadataStatus)).length,
       failed: completedTasks.filter(task => task.viewCount == null && task.viewCountRequested && task.metadataStatus === "failed").length,
       missing: completedTasks.filter(task => task.viewCount == null).length
+    };
+    const tagCounts = {
+      complete: completedTasks.filter(task => task.tagsUpdatedAt).length,
+      pending: completedTasks.filter(task => !task.tagsUpdatedAt && task.tagsRequested && ["pending", "retry", "enriching"].includes(task.metadataStatus)).length,
+      failed: completedTasks.filter(task => !task.tagsUpdatedAt && task.tagsRequested && task.metadataStatus === "failed").length,
+      missing: completedTasks.filter(task => !task.tagsUpdatedAt).length
     };
     return {
       counts: this.store.counts?.() || Object.fromEntries(
@@ -1220,10 +1423,16 @@ export class Scheduler {
       currents: tasks.filter(task => ["resolving", "downloading", "finalizing"].includes(task.state)),
       metadataCounts,
       viewCounts,
+      tagCounts,
       metadataCurrent: tasks.find(task => task.metadataStatus === "enriching") || null,
       metadataCurrents: tasks.filter(task => task.metadataStatus === "enriching"),
       activeTaskCount: this.activeTaskCount(),
+      activeDownloadCount: this.activeDownloadCount(),
+      activeMetadataCount: this.activeMetadataCount(),
       maxConcurrentTasks: this.maxConcurrentTasks(),
+      maxConcurrentDownloads: this.maxConcurrentTasks(),
+      maxConcurrentMetadataTasks: this.maxConcurrentMetadataTasks(),
+      importedMetadataEnrichmentEnabled,
       total: tasks.length
     };
   }
@@ -1233,6 +1442,23 @@ export class Scheduler {
       ? this.store.queryTasks(params)
       : { total: this.store.state.tasks.length, page: 1, pageSize: 10000, tasks: this.store.state.tasks };
     return { ...result, tasks: result.tasks.map(publicTask), authors: this.store.authors?.() || [] };
+  }
+
+  playlistTags(options = {}) {
+    if (this.store.playlistTags) return this.store.playlistTags(options);
+    const counts = new Map();
+    for (const task of this.store.state.tasks || []) {
+      if (task.state !== "completed" || !task.destination) continue;
+      const seen = new Set();
+      for (const tag of normalizeTags(task.tags)) {
+        if (seen.has(tag)) continue;
+        seen.add(tag);
+        counts.set(tag, (counts.get(tag) || 0) + 1);
+      }
+    }
+    return [...counts.entries()].sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0], "zh-CN"))
+      .slice(0, Math.min(40, Math.max(1, Number(options.limit) || 18)))
+      .map(([tag, count]) => ({ tag, count }));
   }
 
   async playlist({ query = "", author = "all", watched = "all", taskId = "", contextId = "", contextIndex = null, contextSize = 5, sort = "updatedAt", direction = "desc", page = 1, pageSize = 25, randomPage = false } = {}) {
@@ -1269,6 +1495,7 @@ export class Scheduler {
         globalIndex: result.globalIndex ?? null,
         hasPrevious: Boolean(result.hasPrevious),
         hasNext: Boolean(result.hasNext),
+        authors: this.store.authors?.() || [],
         items,
         playerError
       };
@@ -1289,7 +1516,7 @@ export class Scheduler {
         } catch {}
         continue;
       }
-      if (![task.title, task.videoId, task.author, task.alias]
+      if (![task.title, task.videoId, task.author, task.alias, ...normalizeTags(task.tags)]
         .some(value => String(value || "").toLocaleLowerCase().includes(needle))) continue;
       try {
         await this.mediaPath(task.id);
@@ -1348,7 +1575,7 @@ export class Scheduler {
         viewsUpdatedAt: task.viewsUpdatedAt || null,
         localFileName: path.basename(task.destination)
       }));
-    return { total: matches.length, page: safePage, pageSize: safePageSize, currentIndex, globalIndex, hasPrevious, hasNext, items };
+    return { total: matches.length, page: safePage, pageSize: safePageSize, currentIndex, globalIndex, hasPrevious, hasNext, authors: this.store.authors?.() || [], items };
   }
 
   async updatePlayback(taskId, payload = {}) {
@@ -1412,8 +1639,50 @@ export class Scheduler {
     return candidates;
   }
 
+  async buildMediaIndex() {
+    const root = path.resolve(this.config.downloadRoot);
+    const index = new Map();
+    const pending = [root];
+    while (pending.length) {
+      const directory = pending.pop();
+      let entries;
+      try {
+        entries = await readdir(directory, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const entry of entries) {
+        const filePath = path.join(directory, entry.name);
+        if (entry.isDirectory()) {
+          pending.push(filePath);
+          continue;
+        }
+        if (!entry.isFile() || !/\.(?:mp4|webm|m4v|mov|mkv|avi)$/i.test(entry.name)) continue;
+        // Downloaded names carry the Iwara video ID in the final [id] part.
+        // This remains useful when a prior categorization step sanitized the
+        // title or changed the containing folder.
+        const match = /\[([^\]]+)\]\.[^.]+$/u.exec(entry.name);
+        if (match && !index.has(match[1])) index.set(match[1], filePath);
+      }
+    }
+    return index;
+  }
+
+  async ensureMediaIndex() {
+    if (this.mediaIndex) return this.mediaIndex;
+    if (!this.mediaIndexPromise) {
+      this.mediaIndexPromise = this.buildMediaIndex()
+        .then(index => { this.mediaIndex = index; return index; })
+        .finally(() => { this.mediaIndexPromise = null; });
+    }
+    return this.mediaIndexPromise;
+  }
+
   async locateMediaFile(task) {
-    for (const filePath of this.mediaCandidates(task)) {
+    const candidates = this.mediaCandidates(task);
+    const indexedPath = (await this.ensureMediaIndex()).get(String(task.videoId || ""));
+    if (indexedPath && !candidates.includes(indexedPath)) candidates.push(indexedPath);
+    for (const filePath of candidates) {
       const info = await fileInfo(filePath);
       if (info) return { path: filePath, info };
     }

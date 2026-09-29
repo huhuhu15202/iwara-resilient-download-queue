@@ -31,7 +31,7 @@
 // @grant             window.close
 // @run-at            document-start
 // @noframes
-// @version           3.3.122
+// @version           3.3.126
 // ==/UserScript==
 "use strict";
 (() => {
@@ -93,11 +93,21 @@
     const type = String(contentType || "").toLowerCase();
     let parsed = null;
     let pathname = raw.toLowerCase();
-    try { parsed = new URL(raw, unsafeWindow.location.href); pathname = parsed.pathname.toLowerCase(); } catch {}
+    let filename = "";
+    try {
+      parsed = new URL(raw, unsafeWindow.location.href);
+      pathname = parsed.pathname.toLowerCase();
+      // Iwara's CDN uses /view?filename=..._Source.mp4 instead of putting the
+      // media extension in the request path.  Native <video> requests and
+      // PerformanceObserver entries do not expose a response MIME type here,
+      // so the filename query parameter is the reliable format hint.
+      filename = String(parsed.searchParams.get("filename") || "").toLowerCase();
+    } catch {}
     if (parsed && /(^|\.)iwara\.(tv|zip|shop|ai)$/i.test(parsed.hostname) && /^\/video\/[^/]+\/?$/i.test(parsed.pathname)) return "";
-    if (/mpegurl/.test(type) || pathname.endsWith(".m3u8")) return "hls";
-    if (/dash\+xml/.test(type) || pathname.endsWith(".mpd")) return "dash";
-    if (/^video\//.test(type) || /\.(?:mp4|webm|m4v|mov)$/i.test(pathname)) return "direct";
+    const mediaHint = `${pathname} ${filename}`;
+    if (/mpegurl/.test(type) || /\.m3u8(?:$|[?#])/i.test(mediaHint)) return "hls";
+    if (/dash\+xml/.test(type) || /\.mpd(?:$|[?#])/i.test(mediaHint)) return "dash";
+    if (/^video\//.test(type) || /\.(?:mp4|webm|m4v|mov)(?:$|[?#])/i.test(mediaHint)) return "direct";
     return "";
   }
   function __iwaraQueueRecordMedia(url, contentType = "", source = "network") {
@@ -5005,6 +5015,8 @@
   var queueBaseUrl = "http://127.0.0.1:18777";
   var maxQueueWorkers = 3;
   var activeQueueWorkers = 0;
+  var maxViewWorkers = 8;
+  var activeViewWorkers = 0;
   var resolverTimer;
   async function queueRequest(pathname, init = {}) {
     const response = await unlimitedFetch(`${queueBaseUrl}${pathname}`, {
@@ -5083,6 +5095,21 @@
     }
   }
 
+  function extractTagField(raw) {
+    const candidates = [
+      ["tags", raw?.tags],
+      ["Tags", raw?.Tags],
+      ["data.tags", raw?.data?.tags],
+      ["video.tags", raw?.video?.tags],
+      ["metadata.tags", raw?.metadata?.tags],
+      ["RAW.tags", raw?.RAW?.tags]
+    ];
+    const found = candidates.find(([, value]) => Array.isArray(value));
+    return found
+      ? { present: true, path: found[0], value: found[1] }
+      : { present: false, path: "", value: [] };
+  }
+
   async function fallbackSniffMetadata(videoId) {
     try {
       const response = await unlimitedFetch(`https://${apiEndpoint}/video/${videoId}`, {
@@ -5090,13 +5117,17 @@
       }, { retry: true, maxRetries: 2, retryDelay: 1000 });
       const raw = await response.json();
       if (!raw?.id) return null;
+      const tagField = extractTagField(raw);
       return {
         ID: raw.id,
         Title: raw.title || "",
         Author: raw.user?.username || "",
         Alias: raw.user?.name || "",
         UploadTime: raw.createdAt ? new Date(raw.createdAt).getTime() : null,
-        Views: raw.views ?? raw.viewCount ?? raw.numViews ?? null
+        Views: raw.views ?? raw.viewCount ?? raw.numViews ?? null,
+        Tags: tagField.value,
+        tagsFieldPresent: tagField.present,
+        tagsFieldPath: tagField.path
       };
     } catch {
       return null;
@@ -5210,7 +5241,8 @@
             Author: info.Author || info.RAW?.user?.username || "",
             Alias: info.Alias || info.RAW?.user?.name || "",
             UploadTime: info.UploadTime || (info.RAW?.createdAt ? new Date(info.RAW.createdAt).getTime() : null),
-            Views: info.Views ?? info.RAW?.views ?? info.RAW?.viewCount ?? info.RAW?.numViews ?? null
+            Views: info.Views ?? info.RAW?.views ?? info.RAW?.viewCount ?? info.RAW?.numViews ?? null,
+            Tags: info.Tags ?? info.RAW?.tags ?? []
           }
         );
         leasedTask = null;
@@ -5242,6 +5274,7 @@
               Alias: info.Alias,
               UploadTime: info.UploadTime,
               Views: info.Views ?? info.RAW?.views ?? info.RAW?.viewCount ?? info.RAW?.numViews ?? null,
+              Tags: info.Tags ?? info.RAW?.tags ?? [],
               DownloadQuality: info.DownloadQuality,
               OriginalFileName: info.FileName,
               Size: info.Size
@@ -5262,8 +5295,8 @@
       if (didWork) unsafeWindow.setTimeout(pumpQueueWorkers, 250);
     }
   }
-  async function enrichOneImportedRecord() {
-    const next = await queueRequest("/api/enrich/next");
+  async function enrichOneImportedRecord(endpoint = "/api/enrich/next") {
+    const next = await queueRequest(endpoint);
     if (!next.task) return false;
     const { taskId, leaseId, videoId } = next.task;
     let response;
@@ -5285,6 +5318,7 @@
       if (!response.ok || !raw.id || !raw.user) {
         throw new Error(raw.message ?? `Iwara HTTP ${response.status}`);
       }
+      const tagField = extractTagField(raw);
       await queueRequest("/api/enrich/result", {
         method: "POST",
         body: JSON.stringify({
@@ -5296,7 +5330,10 @@
             author: raw.user.username,
             alias: raw.user.name,
             uploadTime: new Date(raw.createdAt ?? 0).getTime(),
-            views: raw.views ?? raw.viewCount ?? raw.numViews ?? null
+            views: raw.views ?? raw.viewCount ?? raw.numViews ?? null,
+            tags: tagField.value,
+            tagsFieldPresent: tagField.present,
+            tagsFieldPath: tagField.path
           }
         })
       });
@@ -5314,13 +5351,35 @@
     }
     return true;
   }
+  async function updateOneViewTask() {
+    if (activeViewWorkers >= maxViewWorkers) return;
+    activeViewWorkers += 1;
+    let didWork = false;
+    try {
+      // A single bounded metadata pool services both manual refresh queues.
+      // Prefer tags so a bulk tag refresh cannot sit behind view-count work.
+      didWork = await enrichOneImportedRecord("/api/enrich/next-tags");
+      if (!didWork) didWork = await enrichOneImportedRecord("/api/enrich/next-views");
+    } catch {
+    } finally {
+      activeViewWorkers -= 1;
+      if (didWork) unsafeWindow.setTimeout(pumpViewWorkers, 250);
+    }
+  }
+  function pumpViewWorkers() {
+    while (activeViewWorkers < maxViewWorkers) void updateOneViewTask();
+  }
   function pumpQueueWorkers() {
     while (activeQueueWorkers < maxQueueWorkers) void resolveOneTask();
   }
   function startResilientQueueWorker() {
     if (resolverTimer !== void 0) return;
     pumpQueueWorkers();
-    resolverTimer = unsafeWindow.setInterval(pumpQueueWorkers, 1e3);
+    pumpViewWorkers();
+    resolverTimer = unsafeWindow.setInterval(() => {
+      pumpQueueWorkers();
+      pumpViewWorkers();
+    }, 1e3);
     unsafeWindow.addEventListener("focus", pumpQueueWorkers);
     unsafeWindow.document.addEventListener("visibilitychange", () => {
       if (!unsafeWindow.document.hidden) pumpQueueWorkers();

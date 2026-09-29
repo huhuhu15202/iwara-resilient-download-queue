@@ -8,6 +8,7 @@ import { Aria2Client } from "./aria2-client.mjs";
 import { SQLiteStore } from "./sqlite-store.mjs";
 import { Scheduler } from "./scheduler.mjs";
 import { FfmpegDownloader } from "./ffmpeg-downloader.mjs";
+import { TranscodeCache } from "./transcode-cache.mjs";
 import { createServer } from "./server.mjs";
 
 const appRoot = path.resolve(import.meta.dirname, "..");
@@ -59,6 +60,13 @@ async function loadConfig() {
     aria2Secret: randomBytes(18).toString("hex"),
     maxAttempts: 6,
     maxConcurrentTasks: 3,
+    // Download slots are independent from metadata enrichment slots. Keep
+    // legacy imported-file author/date backfill paused unless explicitly
+    // enabled; tag and view refreshes remain separately available.
+    // Metadata/tag/view refreshes use the browser script's bounded 8-worker
+    // pool and never consume the three download slots.
+    maxConcurrentMetadataTasks: 8,
+    importedMetadataEnrichmentEnabled: false,
     mediaReconcileIntervalMs: 300000,
     mediaReconcileBatchSize: 50,
     retryDelayMs: 3000,
@@ -71,6 +79,11 @@ async function loadConfig() {
     browserFallbackTimeoutMs: 45000,
     minValidMediaBytes: 65536,
     ffmpegPath: "",
+    remoteTranscodeEnabled: true,
+    remoteTranscodeHeight: 480,
+    remoteTranscodeConcurrency: 2,
+    remoteTranscodeCacheMaxBytes: 20 * 1024 * 1024 * 1024,
+    remoteTranscodeCacheMaxAgeMs: 24 * 60 * 60 * 1000,
     // Keep the service loopback-only by default.  When serviceHost is changed
     // to 0.0.0.0 or a LAN address, a persistent token protects non-loopback
     // clients from download-management actions.
@@ -179,6 +192,15 @@ async function main() {
   await store.load();
   const importSummary = await store.importExistingFiles(config.downloadRoot);
   const ffmpeg = new FfmpegDownloader({ configuredPath: config.ffmpegPath || "" });
+  const transcodeCache = config.remoteTranscodeEnabled === false ? null : new TranscodeCache({
+    ffmpeg,
+    root: path.join(dataRoot, "transcode-cache", "480p"),
+    height: config.remoteTranscodeHeight,
+    concurrency: config.remoteTranscodeConcurrency,
+    maxBytes: config.remoteTranscodeCacheMaxBytes,
+    maxAgeMs: config.remoteTranscodeCacheMaxAgeMs
+  });
+  await transcodeCache?.init();
   const scheduler = new Scheduler({
     store,
     aria2,
@@ -210,6 +232,7 @@ async function main() {
     port: config.servicePort,
     accessToken: config.lanAccessToken,
     ffmpeg,
+    transcodeCache,
     onShutdown: shutdown
   });
   await httpServer.listen();
