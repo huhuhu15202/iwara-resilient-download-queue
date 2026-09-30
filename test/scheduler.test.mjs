@@ -546,6 +546,38 @@ describe("scheduler state transitions", () => {
     }
   });
 
+  test("imports local-only media without an Iwara ID", async () => {
+    const root = await tempRoot();
+    let sqlite;
+    try {
+      const mediaRoot = path.join(root, "Video");
+      const localDir = path.join(mediaRoot, "NekroX2");
+      await mkdir(localDir, { recursive: true });
+      const media = path.join(localDir, "没有远程编号.mp4");
+      await writeFile(media, Buffer.concat([Buffer.from([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70]), Buffer.alloc(2048)]));
+      sqlite = new SQLiteStore({
+        filePath: path.join(root, "ledger.sqlite"),
+        legacyJsonPath: path.join(root, "state.json"),
+        backupRoot: path.join(root, "backups")
+      });
+      await sqlite.load();
+      const result = await sqlite.importExistingFiles(mediaRoot);
+      assert.equal(result.scanned, 1);
+      assert.equal(result.imported, 1);
+      assert.equal(result.localImported, 1);
+      assert.equal(result.unmatched, 0);
+      const imported = sqlite.state.tasks[0];
+      assert.match(imported.videoId, /^local-[a-f0-9]{24}$/);
+      assert.equal(imported.localOnly, true);
+      assert.equal(imported.author, "NekroX2");
+      assert.equal(imported.sourcePage, "");
+      assert.equal(imported.destination, media);
+    } finally {
+      sqlite?.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test("background media reconcile checks only a bounded batch", async () => {
     const root = await tempRoot();
     try {

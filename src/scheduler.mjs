@@ -241,6 +241,50 @@ export class Scheduler {
     this.busy = false;
     this.mediaIndex = null;
     this.mediaIndexPromise = null;
+    this.webPresence = { active: false, clients: 0, lastSeenAt: 0 };
+    this.started = false;
+  }
+
+  setWebPresence(active, clients = active ? 1 : 0) {
+    this.webPresence = {
+      active: Boolean(active),
+      clients: Math.max(0, Number(clients) || 0),
+      lastSeenAt: Date.now()
+    };
+    this.updateBackgroundTimers();
+    return this.webPresenceStatus();
+  }
+
+  updateBackgroundTimers() {
+    if (!this.started) return;
+    if (this.timer) return;
+    this.timer = setInterval(() => this.tick().catch(console.error), this.config.pollMs);
+    this.timer.unref?.();
+    const interval = Math.max(60_000, Number(this.config.mediaReconcileIntervalMs || 300_000));
+    this.reconcileTimer = setInterval(() => this.reconcileMediaBatch().catch(console.error), interval);
+    this.reconcileTimer.unref?.();
+  }
+
+  webPresenceStatus() {
+    const activeWork = this.store.state.tasks.some(task =>
+      ["queued", "resolving", "downloading", "finalizing"].includes(task.state) ||
+      task.metadataStatus === "enriching"
+    );
+    return {
+      active: this.webPresence.active,
+      clients: this.webPresence.clients,
+      lastSeenAt: this.webPresence.lastSeenAt || null,
+      activeWork,
+      // The service intentionally stays available after the last page closes.
+      // Keep this field for backwards-compatible status consumers, but never
+      // report the old page-driven sleep mode.
+      sleeping: false,
+      idle: !this.webPresence.active && !activeWork
+    };
+  }
+
+  isBackgroundSleeping() {
+    return false;
   }
 
   async init() {
@@ -254,7 +298,9 @@ export class Scheduler {
       // The scheduler can still reconcile known tasks individually.
     }
     for (const task of this.store.state.tasks) {
-      task.sourcePage = `https://www.iwara.tv/video/${task.videoId}`;
+      if (!task.localOnly && !String(task.videoId || "").startsWith("local-")) {
+        task.sourcePage = `https://www.iwara.tv/video/${task.videoId}`;
+      }
       task.browserFallbackPending ??= false;
       task.browserFallbackAttempted ??= false;
       task.downloadEngine ??= task.gid ? "aria2" : null;
@@ -406,15 +452,13 @@ export class Scheduler {
   }
 
   start() {
-    if (this.timer) return;
-    this.timer = setInterval(() => this.tick().catch(console.error), this.config.pollMs);
-    this.timer.unref?.();
-    const interval = Math.max(60_000, Number(this.config.mediaReconcileIntervalMs || 300_000));
-    this.reconcileTimer = setInterval(() => this.reconcileMediaBatch().catch(console.error), interval);
-    this.reconcileTimer.unref?.();
+    if (this.started) return;
+    this.started = true;
+    this.updateBackgroundTimers();
   }
 
   stop() {
+    this.started = false;
     clearInterval(this.timer);
     this.timer = null;
     clearInterval(this.reconcileTimer);
@@ -714,7 +758,7 @@ export class Scheduler {
     if (waitingDownload) return null;
     const importedMetadataEnrichmentEnabled = this.importedMetadataEnrichmentEnabled();
     const task = this.store.state.tasks.find(item =>
-      item.state === "completed" && item.destination &&
+      !item.localOnly && item.state === "completed" && item.destination &&
       (tagsOnly
         ? item.tagsRequested === true
         : viewsOnly
@@ -836,7 +880,7 @@ export class Scheduler {
   async queueViewCountEnrichment(limit = 0) {
     const max = Math.min(5000, Math.max(0, Number(limit) || 0));
     const candidates = this.store.state.tasks
-      .filter(task => task.state === "completed" && task.destination && task.viewCount == null &&
+      .filter(task => !task.localOnly && task.state === "completed" && task.destination && task.viewCount == null &&
         !(task.viewCountRequested && ["pending", "retry", "enriching", "failed"].includes(task.metadataStatus)))
       .sort((a, b) => String(a.updatedAt || a.completedAt || a.id).localeCompare(String(b.updatedAt || b.completedAt || b.id)));
     const selected = max ? candidates.slice(0, max) : candidates;
@@ -857,7 +901,7 @@ export class Scheduler {
   async refreshViewCountEnrichment(limit = 0) {
     const max = Math.min(5000, Math.max(0, Number(limit) || 0));
     const candidates = this.store.state.tasks
-      .filter(task => task.state === "completed" && task.destination && task.metadataStatus !== "enriching")
+      .filter(task => !task.localOnly && task.state === "completed" && task.destination && task.metadataStatus !== "enriching")
       .sort((a, b) => String(a.updatedAt || a.completedAt || a.id).localeCompare(String(b.updatedAt || b.completedAt || b.id)));
     const selected = max ? candidates.slice(0, max) : candidates;
     for (const task of selected) {
@@ -877,7 +921,7 @@ export class Scheduler {
   async queueTagEnrichment(limit = 0) {
     const max = Math.min(5000, Math.max(0, Number(limit) || 0));
     const candidates = this.store.state.tasks
-      .filter(task => task.state === "completed" && task.destination && !task.tagsUpdatedAt &&
+      .filter(task => !task.localOnly && task.state === "completed" && task.destination && !task.tagsUpdatedAt &&
         task.metadataStatus !== "enriching")
       .sort((a, b) => String(a.updatedAt || a.completedAt || a.id).localeCompare(String(b.updatedAt || b.completedAt || b.id)));
     const selected = max ? candidates.slice(0, max) : candidates;
@@ -899,7 +943,7 @@ export class Scheduler {
   async refreshTagEnrichment(limit = 0) {
     const max = Math.min(5000, Math.max(0, Number(limit) || 0));
     const candidates = this.store.state.tasks
-      .filter(task => task.state === "completed" && task.destination && task.metadataStatus !== "enriching")
+      .filter(task => !task.localOnly && task.state === "completed" && task.destination && task.metadataStatus !== "enriching")
       .sort((a, b) => String(a.updatedAt || a.completedAt || a.id).localeCompare(String(b.updatedAt || b.completedAt || b.id)));
     const selected = max ? candidates.slice(0, max) : candidates;
     for (const task of selected) {
@@ -976,6 +1020,7 @@ export class Scheduler {
       }
     } finally {
       this.busy = false;
+      this.updateBackgroundTimers();
     }
   }
 
@@ -1433,6 +1478,7 @@ export class Scheduler {
       maxConcurrentDownloads: this.maxConcurrentTasks(),
       maxConcurrentMetadataTasks: this.maxConcurrentMetadataTasks(),
       importedMetadataEnrichmentEnabled,
+      webPresence: this.webPresenceStatus(),
       total: tasks.length
     };
   }
@@ -1461,10 +1507,44 @@ export class Scheduler {
       .map(([tag, count]) => ({ tag, count }));
   }
 
-  async playlist({ query = "", author = "all", watched = "all", taskId = "", contextId = "", contextIndex = null, contextSize = 5, sort = "updatedAt", direction = "desc", page = 1, pageSize = 25, randomPage = false } = {}) {
+  async updatePlaylistFlags(taskId, { favorite, watchLater, queued } = {}) {
+    const task = this.store.state.tasks.find(item => item.id === taskId);
+    if (!task || task.state !== "completed") throw new Error("只能操作已完成视频");
+    if (typeof favorite === "boolean") task.favorite = favorite;
+    if (typeof watchLater === "boolean") task.watchLater = watchLater;
+    if (typeof queued === "boolean") {
+      if (queued) {
+        const max = this.store.state.tasks.reduce((value, item) => Math.max(value, Number(item.queuePosition) || 0), 0);
+        task.queuePosition = max + 1;
+      } else task.queuePosition = null;
+    }
+    await this.store.save();
+    return publicTask(task);
+  }
+
+  async retryFailedByCategory(category = "") {
+    const normalized = String(category || "").trim();
+    const selected = this.store.state.tasks.filter(task => task.state === "failed" &&
+      (!normalized || normalized === "all" || task.lastErrorCategory === normalized));
+    for (const task of selected) {
+      task.state = "queued";
+      task.attempts = 0;
+      task.browserFallbackPending = false;
+      task.browserFallbackAttempted = false;
+      task.nextRunAt = 0;
+      task.message = normalized && normalized !== "all"
+        ? `按错误分类重试（${normalized}），等待重新解析`
+        : "按错误分类重试，等待重新解析";
+      task.updatedAt = nowIso();
+    }
+    await this.store.save();
+    return { queued: selected.length, category: normalized || "all" };
+  }
+
+  async playlist({ query = "", author = "all", watched = "all", favorite = "all", watchLater = "all", queue = "all", taskId = "", contextId = "", contextIndex = null, contextSize = 5, sort = "updatedAt", direction = "desc", page = 1, pageSize = 25, randomPage = false } = {}) {
     if (this.store.queryPlaylist) {
       const result = this.store.queryPlaylist({
-        query, author, watched, sort, direction, page, pageSize, randomPage, contextId, contextIndex, contextSize
+        query, author, watched, favorite, watchLater, queue, sort, direction, page, pageSize, randomPage, contextId, contextIndex, contextSize
       });
       let playerError = null;
       if (contextId && !result.currentIndex && result.currentIndex !== 0) {
@@ -1509,6 +1589,12 @@ export class Scheduler {
       // not throw away neighbors when contextId is present.
       if (taskId && !contextId && task.id !== taskId) continue;
       if (author !== "all" && task.author !== author) continue;
+      if (favorite === "favorite" && !task.favorite) continue;
+      if (favorite === "not_favorite" && task.favorite) continue;
+      if (watchLater === "later" && !task.watchLater) continue;
+      if (watchLater === "not_later" && task.watchLater) continue;
+      if (queue === "queued" && !Number.isSafeInteger(Number(task.queuePosition))) continue;
+      if (queue === "not_queued" && Number.isSafeInteger(Number(task.queuePosition))) continue;
       if (!needle) {
         try {
           await this.mediaPath(task.id);
@@ -1526,6 +1612,7 @@ export class Scheduler {
       }
     }
     const valueFor = task => {
+      if (sort === "queue") return Number(task.queuePosition || Number.MAX_SAFE_INTEGER);
       if (sort === "title") return String(task.title || task.videoId || "").toLocaleLowerCase();
       if (sort === "author") return String(task.alias || task.author || "").toLocaleLowerCase();
       if (sort === "uploadTime") return Number(task.uploadTime || 0);
