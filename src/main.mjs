@@ -34,6 +34,11 @@ function isLoopbackHost(host = "") {
   return value === "127.0.0.1" || value === "localhost" || value === "::1" || value === "[::1]";
 }
 
+function isTailscaleAddress(address = "") {
+  const match = /^100\.(\d{1,3})\./.exec(String(address || "").trim());
+  return Boolean(match && Number(match[1]) >= 64 && Number(match[1]) <= 127);
+}
+
 function localLanAddresses() {
   const addresses = [];
   for (const entries of Object.values(networkInterfaces())) {
@@ -41,7 +46,7 @@ function localLanAddresses() {
       if (!entry || entry.internal) continue;
       const address = String(entry.address || "").trim();
       if (!address || address.includes(":")) continue;
-      if (/^(10|192\.168|169\.254)\./.test(address) || /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(address)) {
+      if (/^(10|192\.168|169\.254)\./.test(address) || /^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(address) || isTailscaleAddress(address)) {
         addresses.push(address);
       }
     }
@@ -239,13 +244,15 @@ async function main() {
   console.log(`Iwara 稳定下载队列：http://127.0.0.1:${config.servicePort}/`);
   if (!isLoopbackHost(config.serviceHost)) {
     const token = encodeURIComponent(String(config.lanAccessToken || ""));
-    const urls = localLanAddresses().map(address => `http://${address}:${config.servicePort}/playlist?access_token=${token}`);
+    const urls = localLanAddresses().map(address => isTailscaleAddress(address)
+      ? `http://${address}:${config.servicePort}/playlist?access_token=${token}&profile=remote`
+      : `http://${address}:${config.servicePort}/playlist?access_token=${token}`);
     console.log(`局域网播放令牌已启用；请仅在可信局域网内使用以下链接：`);
-    if (urls.length) urls.forEach(url => console.log(`局域网播放：${url}`));
+    if (urls.length) urls.forEach(url => console.log(`${url.includes("profile=remote") ? "Tailscale 远程播放" : "局域网播放"}：${url}`));
     else console.log(`局域网播放：http://<本机局域网IP>:${config.servicePort}/playlist?access_token=${token}`);
   }
   console.log(`下载目录：${config.downloadRoot}`);
-  console.log(`已有文件扫描：${importSummary.scanned}，新建档：${importSummary.imported}，未识别：${importSummary.unmatched}`);
+  console.log(`已有文件扫描：${importSummary.scanned}，新建档：${importSummary.imported}（其中无 ID 的本地文件：${importSummary.localImported || 0}），未识别：${importSummary.unmatched}`);
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 }

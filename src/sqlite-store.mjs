@@ -3,7 +3,7 @@ import {
   copyFile, mkdir, readdir, readFile, stat, unlink
 } from "node:fs/promises";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 const MEDIA_EXTENSIONS = new Set([".mp4", ".webm", ".mkv", ".mov", ".avi", ".m4v"]);
 const SORT_COLUMNS = {
@@ -16,7 +16,10 @@ const SORT_COLUMNS = {
 };
 
 function extractIwaraId(baseName) {
-  const matches = [...baseName.matchAll(/\[([A-Za-z0-9_-]{14}|[A-Za-z0-9_-]{17})\]/g)];
+  // Historical Iwara filenames also contain 10–13 character IDs.  Keep the
+  // bracket requirement and choose the final token so title tags such as
+  // [MMD] are not mistaken for a video ID.
+  const matches = [...baseName.matchAll(/\[([A-Za-z0-9_-]{10,32})\]/g)];
   return matches.length ? matches.at(-1)[1] : "";
 }
 
@@ -27,6 +30,24 @@ function inferredTitle(baseName, videoId) {
     .replace(/\[(Source|540|720|1080|4K)\]/gi, "")
     .replace(/[_\s-]+$/g, "")
     .trim() || videoId;
+}
+
+function localVideoId(filePath, downloadRoot, size) {
+  // Files copied from older author folders may not contain an Iwara ID. Keep
+  // a deterministic local-only identity so they can be imported once and
+  // remain visible in the ledger without pretending that a remote ID exists.
+  const relative = path.relative(downloadRoot, filePath).replace(/\\/g, "/").toLocaleLowerCase();
+  const digest = createHash("sha256")
+    .update(`${relative}|${Number(size) || 0}`)
+    .digest("hex")
+    .slice(0, 24);
+  return `local-${digest}`;
+}
+
+function localAuthor(filePath, downloadRoot) {
+  const relativeDirectory = path.relative(downloadRoot, path.dirname(filePath));
+  const firstSegment = relativeDirectory.split(/[\\/]/).find(Boolean);
+  return firstSegment || "本地导入";
 }
 
 async function walkMediaFiles(root) {
@@ -123,12 +144,19 @@ export class SQLiteStore {
       ["playback_position", "REAL NOT NULL DEFAULT 0"],
       ["playback_duration", "REAL NOT NULL DEFAULT 0"],
       ["watched", "INTEGER NOT NULL DEFAULT 0"],
-      ["playback_updated_at", "TEXT"]
+      ["playback_updated_at", "TEXT"],
+      ["favorite", "INTEGER NOT NULL DEFAULT 0"],
+      ["watch_later", "INTEGER NOT NULL DEFAULT 0"],
+      ["queue_position", "INTEGER"]
     ];
     for (const [name, definition] of additions) {
       if (!columns.has(name)) this.db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${definition}`);
     }
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_state_media ON tasks(state, media_status, watched, updated_at DESC)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_playlist_flags ON tasks(state, media_status, favorite, watch_later, queue_position)");
+    // Older records have no queue flag in data_json; normalize the newly
+    // added nullable column so they are not mistaken for queued at position 0.
+    this.db.exec("UPDATE tasks SET queue_position=NULL WHERE json_extract(data_json, '$.queuePosition') IS NULL");
     // The default playlist sort is recent-first.  Keep its ordering in the
     // same index so a page request does not build a temporary sort table.
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_playlist_recent ON tasks(state, media_status, updated_at DESC, id ASC)");
@@ -142,16 +170,33 @@ export class SQLiteStore {
   }
 
   reloadMemory() {
-    const rows = this.db.prepare("SELECT data_json FROM tasks ORDER BY created_at").all();
-    this.state.tasks = rows.map(row => JSON.parse(row.data_json));
+    const rows = this.db.prepare("SELECT data_json, favorite, watch_later, queue_position FROM tasks ORDER BY created_at").all();
+    this.state.tasks = rows.map(row => {
+      const task = JSON.parse(row.data_json);
+      task.favorite = Boolean(row.favorite);
+      task.watchLater = Boolean(row.watch_later);
+      task.queuePosition = row.queue_position === null || row.queue_position === undefined ? null : Number(row.queue_position);
+      return task;
+    });
     this.snapshots.clear();
     for (const task of this.state.tasks) this.snapshots.set(task.id, JSON.stringify(task));
+  }
+
+  rowTask(row) {
+    const task = JSON.parse(row.data_json);
+    if (Object.prototype.hasOwnProperty.call(row, "favorite")) task.favorite = Boolean(row.favorite);
+    if (Object.prototype.hasOwnProperty.call(row, "watch_later")) task.watchLater = Boolean(row.watch_later);
+    if (Object.prototype.hasOwnProperty.call(row, "queue_position")) {
+      task.queuePosition = row.queue_position === null || row.queue_position === undefined ? null : Number(row.queue_position);
+    }
+    return task;
   }
 
   backfillIndexedFields() {
     const update = this.db.prepare(`
       UPDATE tasks SET media_status=?, media_size=?, media_checked_at=?,
-        playback_position=?, playback_duration=?, watched=?, playback_updated_at=?
+        playback_position=?, playback_duration=?, watched=?, playback_updated_at=?,
+        favorite=?, watch_later=?, queue_position=?
       WHERE id=?
     `);
     this.db.exec("BEGIN IMMEDIATE");
@@ -170,6 +215,9 @@ export class SQLiteStore {
           Number(task.playbackDuration || 0) || 0,
           task.watched ? 1 : 0,
           task.playbackUpdatedAt || null,
+          task.favorite ? 1 : 0,
+          task.watchLater ? 1 : 0,
+          task.queuePosition !== null && task.queuePosition !== undefined && Number.isSafeInteger(Number(task.queuePosition)) ? Number(task.queuePosition) : null,
           row.id
         );
       }
@@ -209,8 +257,9 @@ export class SQLiteStore {
         id, video_id, state, title, author, alias, upload_time,
         attempts, created_at, updated_at, data_json,
         media_status, media_size, media_checked_at,
-        playback_position, playback_duration, watched, playback_updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        playback_position, playback_duration, watched, playback_updated_at,
+        favorite, watch_later, queue_position
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         video_id=excluded.video_id, state=excluded.state, title=excluded.title,
         author=excluded.author, alias=excluded.alias, upload_time=excluded.upload_time,
@@ -221,7 +270,10 @@ export class SQLiteStore {
         playback_position=excluded.playback_position,
         playback_duration=excluded.playback_duration,
         watched=excluded.watched,
-        playback_updated_at=excluded.playback_updated_at
+        playback_updated_at=excluded.playback_updated_at,
+        favorite=excluded.favorite,
+        watch_later=excluded.watch_later,
+        queue_position=excluded.queue_position
     `).run(
       task.id,
       task.videoId,
@@ -240,7 +292,10 @@ export class SQLiteStore {
       Number(task.playbackPosition || 0) || 0,
       Number(task.playbackDuration || 0) || 0,
       task.watched ? 1 : 0,
-      task.playbackUpdatedAt || null
+      task.playbackUpdatedAt || null,
+      task.favorite ? 1 : 0,
+      task.watchLater ? 1 : 0,
+      task.queuePosition !== null && task.queuePosition !== undefined && Number.isSafeInteger(Number(task.queuePosition)) ? Number(task.queuePosition) : null
     );
     return data;
   }
@@ -332,20 +387,21 @@ export class SQLiteStore {
     const safePageSize = Math.min(200, Math.max(10, Number(pageSize) || 50));
     const safePage = Math.max(1, Number(page) || 1);
     const rows = this.db.prepare(`
-      SELECT data_json FROM tasks ${clause}
+      SELECT data_json, favorite, watch_later, queue_position FROM tasks ${clause}
       ORDER BY ${column} ${order}, id ASC LIMIT ? OFFSET ?
     `).all(...params, safePageSize, (safePage - 1) * safePageSize);
     return {
       total,
       page: safePage,
       pageSize: safePageSize,
-      tasks: rows.map(row => JSON.parse(row.data_json))
+      tasks: rows.map(row => this.rowTask(row))
     };
   }
 
   queryPlaylist({
     query = "", author = "all", watched = "all", sort = "updatedAt",
     direction = "desc", page = 1, pageSize = 30, randomPage = false,
+    favorite = "all", watchLater = "all", queue = "all",
     contextId = "", contextIndex = null, contextSize = 5
   } = {}) {
     const where = ["state='completed'", "media_status='present'", "COALESCE(json_extract(data_json, '$.destination'), '')<>''"];
@@ -359,9 +415,19 @@ export class SQLiteStore {
     if (watched === "watched" || watched === "unwatched") {
       where.push("watched=?"); params.push(watched === "watched" ? 1 : 0);
     }
+    if (favorite === "favorite" || favorite === "not_favorite") {
+      where.push("favorite=?"); params.push(favorite === "favorite" ? 1 : 0);
+    }
+    if (watchLater === "later" || watchLater === "not_later") {
+      where.push("watch_later=?"); params.push(watchLater === "later" ? 1 : 0);
+    }
+    if (queue === "queued" || queue === "not_queued") {
+      where.push(queue === "queued" ? "queue_position IS NOT NULL" : "queue_position IS NULL");
+    }
     const clause = `WHERE ${where.join(" AND ")}`;
     const total = Number(this.db.prepare(`SELECT COUNT(*) AS count FROM tasks ${clause}`).get(...params).count);
     const orderColumns = {
+      queue: "COALESCE(queue_position, 2147483647)",
       title: "LOWER(title)",
       author: "LOWER(CASE WHEN alias<>'' THEN alias ELSE author END)",
       uploadTime: "COALESCE(upload_time, 0)",
@@ -395,8 +461,8 @@ export class SQLiteStore {
           hasPrevious = target > 0;
           hasNext = target < total - 1;
           safePage = 1;
-          const rows = this.db.prepare(`SELECT data_json FROM tasks ${clause} ORDER BY ${orderColumn} ${order}, id ${tieOrder} LIMIT ? OFFSET ?`).all(...params, size, offset);
-          return { total, page: safePage, pageSize: size, currentIndex, globalIndex, hasPrevious, hasNext, tasks: rows.map(row => JSON.parse(row.data_json)) };
+          const rows = this.db.prepare(`SELECT data_json, favorite, watch_later, queue_position FROM tasks ${clause} ORDER BY ${orderColumn} ${order}, id ${tieOrder} LIMIT ? OFFSET ?`).all(...params, size, offset);
+          return { total, page: safePage, pageSize: size, currentIndex, globalIndex, hasPrevious, hasNext, tasks: rows.map(row => this.rowTask(row)) };
         }
       }
       center = this.db.prepare(`SELECT ${orderColumn} AS order_value, id FROM tasks ${clause} AND id=?`).get(...params, contextId);
@@ -412,16 +478,16 @@ export class SQLiteStore {
         hasPrevious = before > 0;
         hasNext = before < total - 1;
         safePage = 1;
-        const rows = this.db.prepare(`SELECT data_json FROM tasks ${clause} ORDER BY ${orderColumn} ${order}, id ${tieOrder} LIMIT ? OFFSET ?`).all(...params, size, offset);
-        return { total, page: safePage, pageSize: size, currentIndex, globalIndex, hasPrevious, hasNext, tasks: rows.map(row => JSON.parse(row.data_json)) };
+        const rows = this.db.prepare(`SELECT data_json, favorite, watch_later, queue_position FROM tasks ${clause} ORDER BY ${orderColumn} ${order}, id ${tieOrder} LIMIT ? OFFSET ?`).all(...params, size, offset);
+        return { total, page: safePage, pageSize: size, currentIndex, globalIndex, hasPrevious, hasNext, tasks: rows.map(row => this.rowTask(row)) };
       }
       return { total, page: 1, pageSize: Math.min(9, Math.max(2, Number(contextSize) || 5)), currentIndex: null, globalIndex: null, hasPrevious: false, hasNext: false, tasks: [] };
     }
     const pageCount = Math.max(1, Math.ceil(total / safePageSize));
     safePage = randomPage ? 1 + Math.floor(Math.random() * pageCount) : Math.min(pageCount, safePage);
     offset = (safePage - 1) * safePageSize;
-    const rows = this.db.prepare(`SELECT data_json FROM tasks ${clause} ORDER BY ${orderColumn} ${order}, id ${tieOrder} LIMIT ? OFFSET ?`).all(...params, safePageSize, offset);
-    return { total, page: safePage, pageSize: safePageSize, currentIndex, globalIndex, hasPrevious: offset > 0, hasNext: offset + rows.length < total, tasks: rows.map(row => JSON.parse(row.data_json)) };
+    const rows = this.db.prepare(`SELECT data_json, favorite, watch_later, queue_position FROM tasks ${clause} ORDER BY ${orderColumn} ${order}, id ${tieOrder} LIMIT ? OFFSET ?`).all(...params, safePageSize, offset);
+    return { total, page: safePage, pageSize: safePageSize, currentIndex, globalIndex, hasPrevious: offset > 0, hasNext: offset + rows.length < total, tasks: rows.map(row => this.rowTask(row)) };
   }
 
   playlistTags({ limit = 18 } = {}) {
@@ -507,23 +573,22 @@ export class SQLiteStore {
     const files = await walkMediaFiles(downloadRoot);
     const existingIds = new Set(this.state.tasks.map(task => task.videoId));
     let imported = 0;
+    let localImported = 0;
     const unmatched = [];
     for (const filePath of files) {
       const parsed = path.parse(filePath);
-      const videoId = extractIwaraId(parsed.name);
-      if (!videoId) {
-        unmatched.push(filePath);
-        continue;
-      }
-      if (existingIds.has(videoId)) continue;
       const info = await stat(filePath);
+      const iwaraId = extractIwaraId(parsed.name);
+      const localOnly = !iwaraId;
+      const videoId = iwaraId || localVideoId(filePath, downloadRoot, info.size);
+      if (existingIds.has(videoId)) continue;
       const timestamp = info.mtime.toISOString();
       const task = {
         id: randomUUID(),
         videoId,
-        sourcePage: `https://www.iwara.tv/video/${videoId}`,
-        title: inferredTitle(parsed.name, videoId),
-        author: "",
+        sourcePage: localOnly ? "" : `https://www.iwara.tv/video/${videoId}`,
+        title: localOnly ? parsed.name : inferredTitle(parsed.name, videoId),
+        author: localOnly ? localAuthor(filePath, downloadRoot) : "",
         alias: "",
         uploadTime: null,
         state: "completed",
@@ -537,19 +602,23 @@ export class SQLiteStore {
         destination: filePath,
         fileStatus: "present",
         imported: true,
+        localOnly,
         metadataStatus: "pending",
         metadataAttempts: 0,
         metadataNextRunAt: 0,
-        metadataMessage: "等待补齐作者和上传日期",
-        message: "从已有文件导入",
+        metadataMessage: localOnly
+          ? "本地文件导入；无 Iwara ID，不请求远程资料"
+          : "等待补齐作者和上传日期",
+        message: localOnly ? "无 Iwara ID 的本地文件导入" : "从已有文件导入",
         gid: null
       };
       this.state.tasks.push(task);
       existingIds.add(videoId);
       imported += 1;
+      if (localOnly) localImported += 1;
     }
     await this.save();
-    const result = { scanned: files.length, imported, unmatched: unmatched.length, unmatchedFiles: unmatched };
+    const result = { scanned: files.length, imported, localImported, unmatched: unmatched.length, unmatchedFiles: unmatched };
     this.setMeta("last_file_import", JSON.stringify({ ...result, unmatchedFiles: undefined, at: new Date().toISOString() }));
     return result;
   }

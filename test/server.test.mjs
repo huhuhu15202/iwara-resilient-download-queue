@@ -13,9 +13,13 @@ import {
 } from "../src/server.mjs";
 import { issueResourceTicket, verifyResourceTicket, RESOURCE_TICKET_LIFETIME_MS } from "../src/resource-ticket.mjs";
 
-function request(port, path, headers = {}, method = "GET") {
+function request(port, path, headers = {}, method = "GET", body = null) {
   return new Promise((resolve, reject) => {
-    const req = http.request({ hostname: "127.0.0.1", port, path, headers, method }, response => {
+    const payload = body == null ? null : JSON.stringify(body);
+    const requestHeaders = { ...headers };
+    if (payload != null && !requestHeaders["content-type"]) requestHeaders["content-type"] = "application/json";
+    if (payload != null) requestHeaders["content-length"] = Buffer.byteLength(payload);
+    const req = http.request({ hostname: "127.0.0.1", port, path, headers: requestHeaders, method }, response => {
       const chunks = [];
       response.on("data", chunk => chunks.push(chunk));
       response.on("end", () => resolve({
@@ -26,7 +30,7 @@ function request(port, path, headers = {}, method = "GET") {
       }));
     });
     req.on("error", reject);
-    req.end();
+    req.end(payload);
   });
 }
 
@@ -82,6 +86,36 @@ test("LAN info endpoint is available on the local service", async () => {
     const payload = JSON.parse(response.body);
     assert.equal(payload.enabled, true);
     assert.equal(payload.port, 0);
+  } finally {
+    await service.close();
+  }
+});
+
+test("presence endpoint wakes the scheduler and returns to idle", async () => {
+  const calls = [];
+  const scheduler = {
+    status: () => ({ ok: true }),
+    setWebPresence(active, clients) {
+      calls.push([active, clients]);
+      return { active, clients, sleeping: false, idle: !active };
+    },
+    webPresenceStatus() { return { active: false, clients: 0, sleeping: false, idle: true }; }
+  };
+  const service = createServer({ scheduler, host: "127.0.0.1", port: 0, onShutdown: () => {} });
+  await service.listen();
+  const port = service.server.address().port;
+  try {
+    const active = await request(port, "/api/presence", {}, "POST", { clientId: "test-client", page: "test", active: true });
+    assert.equal(active.status, 200);
+    assert.equal(JSON.parse(active.body).active, true);
+    assert.equal(JSON.parse(active.body).sleeping, false);
+    const inactive = await request(port, "/api/presence", {}, "POST", { clientId: "test-client", page: "test", active: false });
+    assert.equal(inactive.status, 200);
+    assert.equal(JSON.parse(inactive.body).active, false);
+    assert.equal(JSON.parse(inactive.body).sleeping, false);
+    assert.equal(JSON.parse(inactive.body).idle, true);
+    assert.deepEqual(calls.at(-2), [true, 1]);
+    assert.deepEqual(calls.at(-1), [false, 0]);
   } finally {
     await service.close();
   }
