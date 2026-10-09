@@ -1,5 +1,20 @@
 $ErrorActionPreference = "Stop"
 $appRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$launcherErrorLog = Join-Path $appRoot "launcher-error.log"
+trap {
+    $failureMessage = [string]$_.Exception.Message
+    try { Add-Content -LiteralPath $launcherErrorLog -Value "[$(Get-Date -Format s)] $failureMessage" -Encoding UTF8 } catch {}
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        [System.Windows.Forms.MessageBox]::Show(
+            "Iwara 启动失败。详细信息已记录到：`r`n$launcherErrorLog`r`n`r`n$failureMessage",
+            "Iwara 本地播放列表启动失败",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        ) | Out-Null
+    } catch {}
+    exit 1
+}
 $configPath = if ($env:IWARA_CONFIG_PATH) { $env:IWARA_CONFIG_PATH } else { Join-Path $appRoot "config.json" }
 $examplePath = Join-Path $appRoot "config.example.json"
 $dataRoot = if ($env:IWARA_DATA_ROOT) { $env:IWARA_DATA_ROOT } else { $null }
@@ -85,13 +100,24 @@ for ($attempt = 0; $attempt -lt $maxStartupAttempts; $attempt++) {
 if ($ready) {
     Start-Process "http://127.0.0.1:18777/playlist"
 } else {
-    Write-Host "Iwara queue failed to start. See:" -ForegroundColor Red
+    $failureMessage = "Iwara queue failed to start. See:"
     if ($serviceProcess -and $serviceProcess.HasExited) {
-        Write-Host "Node.js exited with code $($serviceProcess.ExitCode)."
+        $failureMessage += "`r`nNode.js exited with code $($serviceProcess.ExitCode)."
     } elseif ($serviceProcess) {
-        Write-Host "Node.js is still initializing; health check timed out after $startupTimeoutSeconds seconds."
+        $failureMessage += "`r`nNode.js is still initializing; health check timed out after $startupTimeoutSeconds seconds."
     }
-    Write-Host (Join-Path $dataRoot "service-error.log")
-    Read-Host "Press Enter to close"
+    $serviceErrorLog = Join-Path $dataRoot "service-error.log"
+    $failureMessage += "`r`n`r`nService log: $serviceErrorLog"
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        [System.Windows.Forms.MessageBox]::Show(
+            $failureMessage,
+            "Iwara 本地播放列表启动失败",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        ) | Out-Null
+    } catch {
+        Add-Content -LiteralPath $launcherErrorLog -Value "[$(Get-Date -Format s)] $failureMessage" -Encoding UTF8
+    }
     exit 1
 }
