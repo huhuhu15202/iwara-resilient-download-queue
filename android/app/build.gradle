@@ -1,0 +1,111 @@
+import groovy.json.JsonSlurper
+
+plugins {
+    id 'com.android.application'
+}
+
+def configuredToolRoot = providers.gradleProperty('toolRoot')
+        .getOrElse(System.getenv('IWARA_ANDROID_TOOLS') ?: new File(System.getenv('LOCALAPPDATA') ?: '.', 'IwaraAndroidBuildTools').absolutePath)
+def signingRoot = new File(configuredToolRoot, 'signing')
+def passwordFile = new File(signingRoot, 'password.txt')
+def signingPassword = passwordFile.exists() ? passwordFile.getText('UTF-8').trim() : ''
+def generatedPersonalResources = layout.buildDirectory.dir('generated/res/personal')
+def personalConfig = rootProject.file('../config.json')
+
+android {
+    namespace 'com.iwara.local'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.iwara.local'
+        minSdk 26
+        targetSdk 35
+        versionCode 16
+        versionName '0.3.11'
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+    }
+
+    flavorDimensions += 'distribution'
+    productFlavors {
+        standard { dimension 'distribution' }
+        personal { dimension 'distribution' }
+    }
+
+    sourceSets {
+        main {
+            manifest.srcFile 'AndroidManifest.xml'
+            java.srcDirs = ['src/com']
+            res.srcDirs = ['res']
+        }
+        androidTest.java.srcDirs = ['src/androidTest/java']
+        personal.res.srcDir(generatedPersonalResources)
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    signingConfigs {
+        if (signingPassword) {
+            localRelease {
+                storeFile new File(signingRoot, 'iwara-local.jks')
+                storePassword signingPassword
+                keyAlias 'iwara-local'
+                keyPassword signingPassword
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            if (signingPassword && new File(signingRoot, 'iwara-local.jks').exists()) {
+                signingConfig signingConfigs.localRelease
+            }
+        }
+        release {
+            minifyEnabled false
+            if (signingPassword && new File(signingRoot, 'iwara-local.jks').exists()) {
+                signingConfig signingConfigs.localRelease
+            }
+        }
+    }
+}
+
+dependencies {
+    implementation 'androidx.annotation:annotation:1.9.1'
+    implementation 'androidx.media3:media3-exoplayer:1.9.0'
+    implementation 'androidx.media3:media3-ui:1.9.0'
+    implementation 'androidx.media3:media3-session:1.9.0'
+    testImplementation 'junit:junit:4.13.2'
+    androidTestImplementation 'androidx.test:runner:1.7.0'
+    androidTestImplementation 'androidx.test.ext:junit:1.3.0'
+}
+
+def generatePersonalTokenResources = tasks.register('generatePersonalTokenResources') {
+    outputs.dir(generatedPersonalResources)
+    doLast {
+        if (!personalConfig.isFile()) {
+            throw new GradleException('Personal build needs the local config.json')
+        }
+        def config = new JsonSlurper().parse(personalConfig)
+        def token = config.lanAccessToken?.toString()
+        if (!token) throw new GradleException('Personal build config has no LAN token')
+        def xmlEscape = { value -> value.toString().replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                .replace('"', '&quot;').replace("'", '&#39;') }
+        def valuesDir = generatedPersonalResources.get().dir('values').asFile
+        valuesDir.mkdirs()
+        new File(valuesDir, 'personal.xml').setText(
+                "<resources><string name=\"personal_sync_token\" translatable=\"false\">${xmlEscape(token)}</string>" +
+                        "<string name=\"personal_lan_origin\" translatable=\"false\">${xmlEscape(config.personalLanOrigin ?: '')}</string>" +
+                        "<string name=\"personal_tailscale_origin\" translatable=\"false\">${xmlEscape(config.personalTailscaleOrigin ?: '')}</string></resources>",
+                'UTF-8')
+    }
+}
+
+tasks.configureEach { task ->
+    if (task.name != 'generatePersonalTokenResources' &&
+            task.name.contains('Personal')) {
+        task.dependsOn(generatePersonalTokenResources)
+    }
+}

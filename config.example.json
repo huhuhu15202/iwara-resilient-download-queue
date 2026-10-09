@@ -1,9 +1,36 @@
 {
-  "dataRoot": "F:\\IwaraVideos\\R18\\ServiceData",
-  "downloadRoot": "J:\\Video",
+  "dataRoot": "C:\\IwaraData",
+  "downloadRoot": "D:\\Videos",
+  "fallbackDownloadRoot": "E:\\Videos",
+  "downloadMinimumFreeBytes": 5368709120,
+  "downloadFilter": {
+    "version": 1,
+    "blockedTags": [
+      "futa",
+      "futanari",
+      "fata",
+      "扶她",
+      "扶他",
+      "ふたなり"
+    ],
+    "han1meIds": [],
+    "pixivIds": [],
+    "iwaraVideoIds": []
+  },
+  "externalMediaRoots": [
+    "C:\\Han1Download",
+    "D:\\Videos",
+    "E:\\IwaraData\\Han1"
+  ],
+  "han1meDownloadRoot": "E:\\IwaraData\\Han1",
+  "han1meHistoryRoots": [
+    "C:\\Han1Download"
+  ],
   "enginePath": "C:\\Program Files\\MotrixNext\\motrix-next-engine.exe",
   "serviceHost": "127.0.0.1",
   "lanAccessToken": "",
+  "personalLanOrigin": "",
+  "personalTailscaleOrigin": "",
   "servicePort": 18777,
   "aria2Port": 16801,
   "maxAttempts": 6,

@@ -39,6 +39,9 @@ export class TranscodeCache {
     this.active = 0;
     this.closed = false;
     this.cleanupPromise = null;
+    this.activeOutputs = new Set();
+    this.pins = new Map();
+    this.cleanupTimer = null;
   }
 
   async init() {
@@ -47,6 +50,7 @@ export class TranscodeCache {
   }
 
   enqueue(work) {
+    if (this.closed) return Promise.reject(new Error("远程转码服务已关闭"));
     return new Promise((resolve, reject) => {
       this.queue.push({ work, resolve, reject });
       this.pump();
@@ -74,41 +78,76 @@ export class TranscodeCache {
     };
   }
 
-  async get(taskId, scheduler) {
+  retain(filePath) {
+    this.pins.set(filePath, (this.pins.get(filePath) || 0) + 1);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const count = (this.pins.get(filePath) || 1) - 1;
+      if (count > 0) this.pins.set(filePath, count);
+      else this.pins.delete(filePath);
+      this.scheduleCleanup();
+    };
+  }
+
+  scheduleCleanup() {
+    if (this.closed || this.cleanupTimer) return;
+    this.cleanupTimer = setTimeout(() => {
+      this.cleanupTimer = null;
+      void this.cleanup().catch(error => console.error(`转码缓存清理失败：${error.message}`));
+    }, 100);
+    this.cleanupTimer.unref?.();
+  }
+
+  async acquire(taskId, scheduler) {
+    const media = await this.get(taskId, scheduler, { pin: true });
+    return { media, release: media.releaseCachePin };
+  }
+
+  async get(taskId, scheduler, { pin = false } = {}) {
     if (this.closed) throw new Error("远程转码服务已关闭");
     const media = await this.sourceInfo(taskId, scheduler);
+    if (this.closed) throw new Error("远程转码服务已关闭");
     const key = cacheKey(taskId, media, this.height);
+    const targetPath = path.join(this.root, `${key}.mp4`);
+    const release = pin ? this.retain(targetPath) : null;
+    const resultForCaller = output => release ? { ...output, releaseCachePin: release } : output;
+    try {
     const cached = this.cache.get(key);
     if (cached) {
       try {
         const info = await stat(cached.path);
         if (info.size > MIN_OUTPUT_BYTES) {
           await utimes(cached.path, new Date(), new Date()).catch(() => {});
-          return { ...cached, size: info.size };
+          return resultForCaller({ ...cached, size: info.size });
         }
       } catch {}
       this.cache.delete(key);
     }
 
-    const targetPath = path.join(this.root, `${key}.mp4`);
     try {
       const info = await stat(targetPath);
       if (info.size > MIN_OUTPUT_BYTES) {
         const output = this.outputMedia(media, targetPath, info.size);
         this.cache.set(key, output);
         await utimes(targetPath, new Date(), new Date()).catch(() => {});
-        return output;
+        return resultForCaller(output);
       }
     } catch {}
-    if (this.pending.has(key)) return this.pending.get(key);
+    if (this.pending.has(key)) return resultForCaller(await this.pending.get(key));
 
     const job = this.enqueue(async () => {
       const executable = await this.ffmpeg?.resolveExecutable();
       if (!executable) throw new Error("本机未找到 FFmpeg，无法生成远程 480p 视频");
       await mkdir(this.root, { recursive: true });
+      if (this.closed) throw new Error("远程转码服务已关闭");
       // Keep the final .mp4 suffix so FFmpeg selects the MP4 muxer; the
       // .part marker still lets startup cleanup remove interrupted jobs.
       const tempPath = `${targetPath}.part-${process.pid}-${randomBytes(4).toString("hex")}.mp4`;
+      this.activeOutputs.add(tempPath);
+      this.activeOutputs.add(targetPath);
+      try {
       const output = await this.run(executable, media, tempPath);
       await rename(tempPath, targetPath);
       const info = await stat(targetPath);
@@ -118,14 +157,23 @@ export class TranscodeCache {
       }
       const result = this.outputMedia(media, targetPath, info.size);
       this.cache.set(key, result);
-      void this.cleanup();
+      this.scheduleCleanup();
       return result;
+      } finally {
+        this.activeOutputs.delete(tempPath);
+        this.activeOutputs.delete(targetPath);
+        await rm(tempPath, { force: true }).catch(error => console.error(`转码临时文件清理失败：${error.message}`));
+      }
     });
     this.pending.set(key, job);
     try {
-      return await job;
+      return resultForCaller(await job);
     } finally {
       this.pending.delete(key);
+    }
+    } catch (error) {
+      release?.();
+      throw error;
     }
   }
 
@@ -140,6 +188,7 @@ export class TranscodeCache {
   }
 
   run(executable, media, outputPath) {
+    if (this.closed) return Promise.reject(new Error("远程转码服务已关闭"));
     return new Promise((resolve, reject) => {
       const args = [
         "-nostdin", "-y", "-hide_banner", "-loglevel", "error",
@@ -195,13 +244,17 @@ export class TranscodeCache {
         const filePath = path.join(this.root, entry.name);
         let info;
         try { info = await stat(filePath); } catch { continue; }
+        if (this.activeOutputs.has(filePath) || this.pins.has(filePath)) {
+          if (entry.name.endsWith(".mp4") && !entry.name.includes(".part-")) entries.push({ path: filePath, size: info.size, mtimeMs: info.mtimeMs });
+          continue;
+        }
         if (entry.name.includes(".part-")) {
-          await rm(filePath, { force: true }).catch(() => {});
+          await this.removeCachedFile(filePath);
           continue;
         }
         if (!entry.name.endsWith(".mp4")) continue;
         if (this.maxAgeMs > 0 && now - info.mtimeMs > this.maxAgeMs) {
-          await rm(filePath, { force: true }).catch(() => {});
+          await this.removeCachedFile(filePath);
           continue;
         }
         entries.push({ path: filePath, size: info.size, mtimeMs: info.mtimeMs });
@@ -210,8 +263,7 @@ export class TranscodeCache {
         let total = entries.reduce((sum, item) => sum + item.size, 0);
         for (const item of entries.sort((a, b) => a.mtimeMs - b.mtimeMs)) {
           if (total <= this.maxBytes) break;
-          await rm(item.path, { force: true }).catch(() => {});
-          total -= item.size;
+          if (await this.removeCachedFile(item.path)) total -= item.size;
         }
       }
     })().finally(() => { this.cleanupPromise = null; });
@@ -220,9 +272,24 @@ export class TranscodeCache {
 
   close() {
     this.closed = true;
+    clearTimeout(this.cleanupTimer);
+    this.cleanupTimer = null;
     for (const process of this.processes) {
       try { process.kill("SIGTERM"); } catch {}
     }
     for (const item of this.queue.splice(0)) item.reject(new Error("远程转码服务已关闭"));
+    return Promise.allSettled([...this.pending.values(), ...(this.cleanupPromise ? [this.cleanupPromise] : [])]);
+  }
+
+  async removeCachedFile(filePath) {
+    if (this.activeOutputs.has(filePath) || this.pins.has(filePath)) return false;
+    try {
+      await rm(filePath, { force: true });
+      for (const [key, value] of this.cache) if (value.path === filePath) this.cache.delete(key);
+      return true;
+    } catch (error) {
+      console.error(`转码缓存文件暂不能清理：${error.message}`);
+      return false;
+    }
   }
 }

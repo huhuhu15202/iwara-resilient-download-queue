@@ -31,7 +31,7 @@
 // @grant             window.close
 // @run-at            document-start
 // @noframes
-// @version           3.3.126
+// @version           3.3.130
 // ==/UserScript==
 "use strict";
 (() => {
@@ -974,6 +974,10 @@
     tryRestartingDownload: "→ Click here to restart download ←",
     tryReparseDownload: "→ Click here to reparse ←",
     openVideoLink: "→ Visit Video Page ←",
+    queueYoutubeDownload: "→ Download this YouTube video locally ←",
+    youtubeDownloadQueued: "YouTube video added to the local download queue",
+    youtubeDownloadAlreadyQueued: "This YouTube video is already queued or downloaded",
+    youtubeDownloadQueueFailed: "Local YouTube download could not be queued:",
     copySucceed: "Copy succeeded!",
     pushTaskSucceed: "Task pushed successfully!",
     exportConfig: "Export Configuration",
@@ -1099,6 +1103,10 @@
     tryRestartingDownload: "→ ここをクリックしてダウンロードを再開 ←",
     tryReparseDownload: "→ ここをクリックして再解析 ←",
     openVideoLink: "→ 動画ページへ ←",
+    queueYoutubeDownload: "→ この YouTube 動画をローカルにダウンロード ←",
+    youtubeDownloadQueued: "YouTube 動画をローカルダウンロードキューに追加しました",
+    youtubeDownloadAlreadyQueued: "この YouTube 動画は既にキューにあるか、ダウンロード済みです",
+    youtubeDownloadQueueFailed: "ローカル YouTube ダウンロードを登録できませんでした：",
     copySucceed: "コピー成功！",
     pushTaskSucceed: "ダウンロードタスクのプッシュ成功！",
     exportConfig: "設定をエクスポート",
@@ -1224,6 +1232,10 @@
     tryRestartingDownload: "→ 点击此处重新下载 ←",
     tryReparseDownload: "→ 点击此处重新解析 ←",
     openVideoLink: "→ 进入视频页面 ←",
+    queueYoutubeDownload: "→ 点击使用本机下载 YouTube 视频 ←",
+    youtubeDownloadQueued: "YouTube 视频已加入本机下载队列",
+    youtubeDownloadAlreadyQueued: "这个 YouTube 视频已经在队列中或已下载",
+    youtubeDownloadQueueFailed: "无法加入本机 YouTube 下载队列：",
     copySucceed: "复制成功！",
     pushTaskSucceed: "推送下载任务成功",
     pushTaskFail: "推送下载任务失败",
@@ -2495,13 +2507,25 @@
         url,
         headers: init.headers || {},
         data: init.body || void 0,
-        onload: (res) => resolve(new Response(res.responseText, { status: res.status, statusText: res.statusText })),
+        onload: (res) => {
+          const headers = new Headers();
+          for (const line of String(res.responseHeaders || "").split(/\r?\n/)) {
+            const index = line.indexOf(":");
+            if (index > 0 && /^(retry-after|content-type)$/i.test(line.slice(0, index).trim())) headers.append(line.slice(0, index).trim(), line.slice(index + 1).trim());
+          }
+          resolve(new Response(res.responseText, { status: res.status, statusText: res.statusText, headers }));
+        },
         onerror: (err) => reject(new Error(
           err?.error ?? err?.statusText ?? "GM_xmlhttpRequest network error"
         )),
         ontimeout: () => reject(new Error("Request timeout"))
       });
     });
+  }
+  function queueHttpFailure(response, stage, reason = "") {
+    const retryAfter = response?.headers?.get("retry-after") || "";
+    const delay = /^\d+$/.test(retryAfter) ? Number(retryAfter) * 1000 : Math.max(0, Date.parse(retryAfter) - Date.now()) || 0;
+    return { stage, httpStatus: response?.status || null, reason, retryAfterMs: Math.min(60_000, delay) };
   }
   var unlimitedFetch = async (input, init = {}, retryOptions) => {
     const { force = false, retry = false, maxRetries = 3, retryDelay = 3e3, successStatus = [200, 201], failStatus = [403, 404], onRetry, onFail } = retryOptions ?? {};
@@ -3153,6 +3177,7 @@
     let ID = info.ID;
     let Type = info.Type;
     let RAW = info.RAW;
+    let queueFailure = { stage: "video_api" };
     try {
       switch (info.Type) {
         case "cache":
@@ -3165,7 +3190,7 @@
         case "partial":
         case "full":
           GM_getValue("isDebug") && originalConsole.debug(`[debug] try parse full source`);
-          let sourceResult = await (await unlimitedFetch(
+          let sourceResponse = await unlimitedFetch(
             `https://${apiEndpoint}/video/${info.ID}`,
             {
               headers: await getAuth()
@@ -3182,14 +3207,27 @@
                 GM_getValue("isDebug") && originalConsole.debug("[Debug]", `${response.url} Fail, response: ${await response.clone().text()}`);
               }
             }
-          )).json();
+          );
+          if ([401, 403].includes(sourceResponse.status)) {
+            try { await refreshToken(); } catch { /* Report current-account permission accurately. */ }
+            sourceResponse = await unlimitedFetch(`https://${apiEndpoint}/video/${info.ID}`, { headers: await getAuth() });
+          }
+          queueFailure = { ...queueHttpFailure(sourceResponse, "video_api"), reason: "unverified_response" };
+          let sourceResult = await sourceResponse.json();
+          // HTML/proxy rejection is not proof of a removed/private Iwara video.
+          if (sourceResult && typeof sourceResult === "object" && !Array.isArray(sourceResult)) queueFailure.reason = "";
+          if (!sourceResponse.ok) {
+            Type = "fail";
+            return { ID, Type, RAW, Msg: sourceResult.message || `Iwara HTTP ${sourceResponse.status}`, Failure: queueFailure };
+          }
           if (isNullOrUndefined(sourceResult.id)) {
             Type = "fail";
             return {
               ID,
               Type,
               RAW,
-              Msg: sourceResult.message ?? stringify(sourceResult)
+              Msg: sourceResult.message ?? stringify(sourceResult),
+              Failure: { ...queueFailure, reason: /private|permission|unauthorized/i.test(sourceResult.message || "") ? "permission_denied" : "" }
             };
           }
           RAW = sourceResult;
@@ -3222,7 +3260,8 @@
         ID,
         Type,
         RAW,
-        Msg: stringify(error)
+        Msg: stringify(error),
+        Failure: queueFailure
       };
     }
     let FileName;
@@ -3296,7 +3335,11 @@
           Description = RAW.body;
           FileName = RAW.file.name;
           Size = RAW.file.size;
-          let VideoFileSource = (await (await unlimitedFetch(RAW.fileUrl, { headers: await getAuth(RAW.fileUrl) })).json()).sort((a2, b2) => (!isNullOrUndefined(config.priority[b2.name]) ? config.priority[b2.name] : 0) - (!isNullOrUndefined(config.priority[a2.name]) ? config.priority[a2.name] : 0));
+          queueFailure = { stage: "source_api" };
+          const fileResponse = await unlimitedFetch(RAW.fileUrl, { headers: await getAuth(RAW.fileUrl) });
+          queueFailure = queueHttpFailure(fileResponse, "source_api");
+          if (!fileResponse.ok) throw new Error(`媒体源接口 HTTP ${fileResponse.status}`);
+          let VideoFileSource = (await fileResponse.json()).sort((a2, b2) => (!isNullOrUndefined(config.priority[b2.name]) ? config.priority[b2.name] : 0) - (!isNullOrUndefined(config.priority[a2.name]) ? config.priority[a2.name] : 0));
           if (isNullOrUndefined(VideoFileSource) || !(VideoFileSource instanceof Array) || VideoFileSource.length < 1) throw new Error(i18nList[config.language].getVideoSourceFailed.toString());
           DownloadQuality = config.checkPriority ? config.downloadPriority : VideoFileSource[0].name;
           let fileList = VideoFileSource.filter((x2) => x2.name === DownloadQuality);
@@ -3403,7 +3446,8 @@
         ExternalUrl,
         Description,
         Unlisted,
-        Msg: stringify(error)
+        Msg: stringify(error),
+        Failure: queueFailure
       };
     }
   }
@@ -4807,6 +4851,7 @@
         return await pushDownloadTask(await parseVideoInfo(videoInfo));
       case "fail":
         const cache = await db.getVideoById(videoInfo.ID);
+        const youtubeExternal = videoInfo.External && isYoutubeExternalUrl(videoInfo.ExternalUrl);
         newToast(
           3,
           {
@@ -4816,11 +4861,29 @@
               { nodeType: "br" },
               videoInfo.Msg,
               { nodeType: "br" },
-              videoInfo.External ? `%#openVideoLink#%` : `%#tryReparseDownload#%`
+              youtubeExternal ? `%#queueYoutubeDownload#%` : videoInfo.External ? `%#openVideoLink#%` : `%#tryReparseDownload#%`
             ], "%#createTask#%"),
             async onClick() {
               this.hide();
-              if (videoInfo.External && !isNullOrUndefined(videoInfo.ExternalUrl) && !videoInfo.ExternalUrl.isEmpty()) {
+              if (youtubeExternal) {
+                try {
+                  const result = await queueRequest("/api/youtube-downloads", {
+                    method: "POST",
+                    body: JSON.stringify({ url: videoInfo.ExternalUrl })
+                  });
+                  newToast(1, {
+                    text: result.duplicate ? "%#youtubeDownloadAlreadyQueued#%" : "%#youtubeDownloadQueued#%",
+                    close: true,
+                    duration: 8e3
+                  }).show();
+                } catch (error) {
+                  newToast(2, {
+                    text: `%#youtubeDownloadQueueFailed#% ${error.message}`,
+                    close: true,
+                    duration: -1
+                  }).show();
+                }
+              } else if (videoInfo.External && !isNullOrUndefined(videoInfo.ExternalUrl) && !videoInfo.ExternalUrl.isEmpty()) {
                 GM_openInTab(videoInfo.ExternalUrl, { active: false, insert: true, setParent: true });
               } else {
                 await pushDownloadTask(await parseVideoInfo({ Type: "init", ID: videoInfo.ID, RAW: videoInfo.RAW ?? cache?.RAW }));
@@ -5013,6 +5076,17 @@
     unsafeWindow.document.body.appendChild(body);
   }
   var queueBaseUrl = "http://127.0.0.1:18777";
+  function isYoutubeExternalUrl(value) {
+    try {
+      const parsed = new URL(String(value || ""));
+      return parsed.protocol === "https:" && [
+        "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com",
+        "youtu.be", "www.youtu.be", "youtube-nocookie.com", "www.youtube-nocookie.com"
+      ].includes(parsed.hostname.toLowerCase());
+    } catch {
+      return false;
+    }
+  }
   var maxQueueWorkers = 3;
   var activeQueueWorkers = 0;
   var maxViewWorkers = 8;
@@ -5030,15 +5104,37 @@
     if (!response.ok) throw new Error(payload?.error ?? `Queue HTTP ${response.status}`);
     return payload;
   }
-  async function submitToResilientQueue(videoIds) {
+  function queuedMetadataFromInfo(info) {
+    const raw = info?.RAW ?? {};
+    const user = raw?.user ?? {};
+    const metadata = {};
+    const title = info?.Title ?? raw?.title;
+    const author = info?.Author ?? user?.username;
+    const alias = info?.Alias ?? user?.name;
+    const uploadTime = info?.UploadTime ?? (raw?.createdAt ? Date.parse(raw.createdAt) : null);
+    const views = info?.Views ?? raw?.views ?? raw?.viewCount ?? raw?.numViews;
+    const tags = info?.Tags ?? raw?.tags;
+    if (typeof title === "string" && title.trim()) metadata.title = title.trim();
+    if (typeof author === "string" && author.trim()) metadata.author = author.trim();
+    if (typeof alias === "string" && alias.trim()) metadata.alias = alias.trim();
+    if (Number.isFinite(Number(uploadTime)) && Number(uploadTime) > 0) metadata.uploadTime = Number(uploadTime);
+    if (views != null && Number.isFinite(Number(views))) metadata.viewCount = Number(views);
+    if (Array.isArray(tags)) metadata.tags = tags.map((tag) => typeof tag === "string" ? tag : tag?.name ?? tag?.title ?? tag?.label ?? tag?.id ?? "").filter(Boolean);
+    return metadata;
+  }
+  async function submitToResilientQueue(videoItems) {
+    const items = videoItems.map((item) => typeof item === "string" ? { videoId: item } : {
+      videoId: item.videoId,
+      ...(item.metadata ? { metadata: item.metadata } : {})
+    });
     const result = await queueRequest("/api/tasks", {
       method: "POST",
-      body: JSON.stringify({ items: videoIds.map((videoId) => ({ videoId })) })
+      body: JSON.stringify({ items })
     });
     if (result.accepted.length) pumpQueueWorkers();
     return result;
   }
-  async function reportResolutionFailure(task, error, partialMetadata = null) {
+  async function reportResolutionFailure(task, error, partialMetadata = null, failure = null) {
     await queueRequest("/api/resolve/result", {
       method: "POST",
       body: JSON.stringify({
@@ -5046,7 +5142,8 @@
         leaseId: task.leaseId,
         ok: false,
         error: error instanceof Error ? error.message : String(error),
-        partialMetadata
+        partialMetadata,
+        failure: failure || error?.Failure || { stage: "unknown" }
       })
     });
   }
@@ -5162,7 +5259,8 @@
             taskId,
             leaseId,
             ok: false,
-            error: `网页已打开并尝试播放 ${Math.round(timeoutMs / 1000)} 秒，但未嗅探到 MP4/M3U8/MPD 媒体请求`
+            error: `网页已打开并尝试播放 ${Math.round(timeoutMs / 1000)} 秒，但未嗅探到 MP4/M3U8/MPD 媒体请求`,
+            failure: { stage: "browser_sniff", reason: "no_media_request" }
           })
         });
       } else {
@@ -5243,7 +5341,8 @@
             UploadTime: info.UploadTime || (info.RAW?.createdAt ? new Date(info.RAW.createdAt).getTime() : null),
             Views: info.Views ?? info.RAW?.views ?? info.RAW?.viewCount ?? info.RAW?.numViews ?? null,
             Tags: info.Tags ?? info.RAW?.tags ?? []
-          }
+          },
+          info.Failure
         );
         leasedTask = null;
         return;
@@ -5351,14 +5450,57 @@
     }
     return true;
   }
+  async function enrichOneAuthorRecord() {
+    const next = await queueRequest("/api/enrich/next-authors");
+    if (!next.task) return false;
+    const { taskId, leaseId, videoId } = next.task;
+    let response;
+    try {
+      response = await unlimitedFetch(
+        `https://${apiEndpoint}/video/${videoId}`,
+        { headers: await getAuth() },
+        {
+          retry: true,
+          maxRetries: 3,
+          retryDelay: 1e3,
+          failStatus: [403, 404],
+          onRetry: async () => { await refreshToken(); }
+        }
+      );
+      const raw = await response.json();
+      const author = String(raw?.user?.username || "").trim();
+      const alias = String(raw?.user?.name || "").trim();
+      if (!response.ok || !raw?.id || (!author && !alias)) {
+        throw new Error(raw?.message || `Iwara HTTP ${response.status}：没有作者字段`);
+      }
+      await queueRequest("/api/enrich/authors-result", {
+        method: "POST",
+        body: JSON.stringify({ taskId, leaseId, ok: true, author, alias })
+      });
+    } catch (error) {
+      await queueRequest("/api/enrich/authors-result", {
+        method: "POST",
+        body: JSON.stringify({
+          taskId,
+          leaseId,
+          ok: false,
+          permanent: response?.status === 404,
+          error: error instanceof Error ? error.message : String(error)
+        })
+      });
+    }
+    return true;
+  }
   async function updateOneViewTask() {
     if (activeViewWorkers >= maxViewWorkers) return;
     activeViewWorkers += 1;
     let didWork = false;
     try {
-      // A single bounded metadata pool services both manual refresh queues.
+      // Refill missing Iwara authors first; this path writes only author fields.
+      didWork = await enrichOneAuthorRecord();
+      // A single bounded metadata pool services the existing tag/view queues.
       // Prefer tags so a bulk tag refresh cannot sit behind view-count work.
-      didWork = await enrichOneImportedRecord("/api/enrich/next-tags");
+      if (!didWork) didWork = await enrichOneImportedRecord("/api/enrich/next-tags");
       if (!didWork) didWork = await enrichOneImportedRecord("/api/enrich/next-views");
     } catch {
     } finally {
@@ -5405,9 +5547,11 @@
     const hasFullInfo = info?.Type === "full" || info?.Type === "partial";
     const authorLink = element.querySelector("a.username");
     let Title = hasFullInfo ? info?.Title : info?.RAW?.title ?? element.querySelector(".videoTeaser__title")?.getAttribute("title") ?? void 0;
-    let Alias = hasFullInfo ? info?.Alias : info?.RAW?.user.name ?? authorLink?.getAttribute("title") ?? void 0;
-    let Author = hasFullInfo ? info?.Author : info?.RAW?.user.username ?? authorLink?.href.toURL().pathname.split("/").pop();
-    let UploadTime = hasFullInfo ? info?.UploadTime : new Date(info?.RAW?.updatedAt ?? 0).getTime();
+    let Alias = hasFullInfo ? info?.Alias : info?.RAW?.user?.name ?? authorLink?.getAttribute("title") ?? void 0;
+    let Author = hasFullInfo ? info?.Author : info?.RAW?.user?.username ?? authorLink?.href.toURL().pathname.split("/").pop();
+    let UploadTime = hasFullInfo ? info?.UploadTime : info?.RAW?.createdAt ? new Date(info.RAW.createdAt).getTime() : null;
+    let Views = hasFullInfo ? info?.Views : info?.RAW?.views ?? info?.RAW?.viewCount ?? info?.RAW?.numViews;
+    let Tags = hasFullInfo ? info?.Tags : info?.RAW?.tags;
     let button = renderNode({
       nodeType: "input",
       attributes: {
@@ -5428,7 +5572,9 @@
             Title,
             Alias,
             Author,
-            UploadTime
+            UploadTime,
+            Views,
+            Tags
           }) : selectList.delete(ID);
           event.stopPropagation();
           event.stopImmediatePropagation();
@@ -6049,10 +6195,13 @@
         const ids = Array.from(selectList.keys());
         if (!ids.length) return;
         try {
-          const result = await submitToResilientQueue(ids);
+          const result = await submitToResilientQueue(ids.map((videoId) => ({
+            videoId,
+            metadata: queuedMetadataFromInfo(selectList.get(videoId))
+          })));
           ids.forEach((id) => selectList.delete(id));
           newToast(1, {
-            text: `已加入 ${result.accepted.length} 个任务，跳过 ${result.ignored.length} 个已有记录`,
+            text: `已加入 ${result.accepted.length} 个任务，跳过 ${result.ignored.length} 个已有记录${result.ignored.some((item) => item.metadataUpdated) ? "；已顺便补上已有记录的网页资料" : ""}`,
             close: true
           }).show();
         } catch (error) {
@@ -6078,9 +6227,10 @@
           return;
         }
         try {
-          const result = await submitToResilientQueue([match[1]]);
+          const cachedInfo = await db.getVideoById(match[1]);
+          const result = await submitToResilientQueue([{ videoId: match[1], metadata: queuedMetadataFromInfo(cachedInfo) }]);
           newToast(1, {
-            text: result.accepted.length ? "已加入稳定下载队列" : "该视频已有下载记录",
+            text: result.accepted.length ? "已加入稳定下载队列" : result.ignored?.[0]?.metadataUpdated ? "该视频已有记录，已补入网页资料" : "该视频已有下载记录",
             close: true
           }).show();
         } catch (error) {

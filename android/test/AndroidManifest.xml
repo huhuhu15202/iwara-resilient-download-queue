@@ -1,0 +1,19 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.mxtech.videoplayer.ad" android:versionCode="1" android:versionName="isolated-test">
+    <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="35" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <application android:label="Isolated MX intent mock" android:usesCleartextTraffic="true">
+        <provider android:name="com.iwara.tests.QueueProbeProvider" android:authorities="com.iwara.tests.queue-probe" android:exported="true" />
+        <activity android:name="com.iwara.tests.MockPlayer" android:exported="true">
+            <intent-filter><action android:name="android.intent.action.VIEW" /><category android:name="android.intent.category.DEFAULT" /><data android:scheme="content" android:mimeType="video/*" /></intent-filter>
+        </activity>
+    </application>
+    <instrumentation android:name="com.iwara.tests.IntegrationTest" android:targetPackage="com.iwara.local" android:functionalTest="true" />
+    <instrumentation android:name="com.iwara.tests.LanTest" android:targetPackage="com.iwara.local" android:functionalTest="true" />
+    <instrumentation android:name="com.iwara.tests.UiTest" android:targetPackage="com.iwara.local" android:functionalTest="true" />
+    <instrumentation android:name="com.iwara.tests.FolderTest" android:targetPackage="com.iwara.local" android:functionalTest="true" />
+    <instrumentation android:name="com.iwara.tests.ManagementTest" android:targetPackage="com.iwara.local" android:functionalTest="true" />
+    <instrumentation android:name="com.iwara.tests.DuplicateTest" android:targetPackage="com.iwara.local" android:functionalTest="true" />
+    <instrumentation android:name="com.iwara.tests.StoragePermissionTest" android:targetPackage="com.iwara.local" android:functionalTest="true" />
+    <instrumentation android:name="com.iwara.tests.SyncTest" android:targetPackage="com.iwara.local" android:functionalTest="true" />
+    <instrumentation android:name="com.iwara.tests.QueueTest" android:targetPackage="com.iwara.local" android:functionalTest="true" />
+</manifest>

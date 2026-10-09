@@ -1,9 +1,22 @@
-import { DatabaseSync, backup as sqliteBackup } from "node:sqlite";
+import { DatabaseSync } from "node:sqlite";
 import {
   copyFile, mkdir, readdir, readFile, stat, unlink
 } from "node:fs/promises";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
+import { shuffleWithSeed } from "./seeded-random.mjs";
+import { BackupManager } from "./backup-manager.mjs";
+import { normalizeMediaSource } from "./media-source.mjs";
+
+const PLAYLIST_SOURCE_SQL = {
+  han1: `(lower(COALESCE(json_extract(data_json, '$.sourcePlatform'), '')) IN ('han1meview','han1me','hanime') OR lower(video_id) LIKE 'han1meview-%')`,
+  iwara: `(lower(COALESCE(json_extract(data_json, '$.sourcePlatform'), '')) IN ('iwara','iwara.tv') OR lower(COALESCE(json_extract(data_json, '$.sourcePage'), '')) LIKE 'https://www.iwara.tv/video/%' OR lower(COALESCE(json_extract(data_json, '$.sourcePage'), '')) LIKE 'https://iwara.tv/video/%')`
+};
+
+function addPlaylistSource(source, where) {
+  const normalized = normalizeMediaSource(source);
+  if (normalized !== "all") where.push(PLAYLIST_SOURCE_SQL[normalized]);
+}
 
 const MEDIA_EXTENSIONS = new Set([".mp4", ".webm", ".mkv", ".mov", ".avi", ".m4v"]);
 const SORT_COLUMNS = {
@@ -61,6 +74,7 @@ async function walkMediaFiles(root) {
       throw error;
     }
     for (const entry of entries) {
+      if (entry.isSymbolicLink()) continue;
       const fullPath = path.join(directory, entry.name);
       if (entry.isDirectory()) await visit(fullPath);
       else if (entry.isFile() && MEDIA_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) {
@@ -147,13 +161,16 @@ export class SQLiteStore {
       ["playback_updated_at", "TEXT"],
       ["favorite", "INTEGER NOT NULL DEFAULT 0"],
       ["watch_later", "INTEGER NOT NULL DEFAULT 0"],
+      ["discarded", "INTEGER NOT NULL DEFAULT 0"],
       ["queue_position", "INTEGER"]
     ];
     for (const [name, definition] of additions) {
       if (!columns.has(name)) this.db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${definition}`);
     }
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_state_media ON tasks(state, media_status, watched, updated_at DESC)");
-    this.db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_playlist_flags ON tasks(state, media_status, favorite, watch_later, queue_position)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_playlist_flags ON tasks(state, media_status, favorite, watch_later, discarded, queue_position)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_playlist_discarded_recent ON tasks(state, media_status, discarded, updated_at DESC, id ASC)");
+    this.db.exec("UPDATE tasks SET discarded=1 WHERE discarded=0 AND json_extract(data_json, '$.discarded')=1");
     // Older records have no queue flag in data_json; normalize the newly
     // added nullable column so they are not mistaken for queued at position 0.
     this.db.exec("UPDATE tasks SET queue_position=NULL WHERE json_extract(data_json, '$.queuePosition') IS NULL");
@@ -170,11 +187,12 @@ export class SQLiteStore {
   }
 
   reloadMemory() {
-    const rows = this.db.prepare("SELECT data_json, favorite, watch_later, queue_position FROM tasks ORDER BY created_at").all();
+    const rows = this.db.prepare("SELECT data_json, favorite, watch_later, discarded, queue_position FROM tasks ORDER BY created_at").all();
     this.state.tasks = rows.map(row => {
       const task = JSON.parse(row.data_json);
       task.favorite = Boolean(row.favorite);
       task.watchLater = Boolean(row.watch_later);
+      task.discarded = Boolean(row.discarded);
       task.queuePosition = row.queue_position === null || row.queue_position === undefined ? null : Number(row.queue_position);
       return task;
     });
@@ -186,6 +204,7 @@ export class SQLiteStore {
     const task = JSON.parse(row.data_json);
     if (Object.prototype.hasOwnProperty.call(row, "favorite")) task.favorite = Boolean(row.favorite);
     if (Object.prototype.hasOwnProperty.call(row, "watch_later")) task.watchLater = Boolean(row.watch_later);
+    if (Object.prototype.hasOwnProperty.call(row, "discarded")) task.discarded = Boolean(row.discarded);
     if (Object.prototype.hasOwnProperty.call(row, "queue_position")) {
       task.queuePosition = row.queue_position === null || row.queue_position === undefined ? null : Number(row.queue_position);
     }
@@ -196,7 +215,7 @@ export class SQLiteStore {
     const update = this.db.prepare(`
       UPDATE tasks SET media_status=?, media_size=?, media_checked_at=?,
         playback_position=?, playback_duration=?, watched=?, playback_updated_at=?,
-        favorite=?, watch_later=?, queue_position=?
+        favorite=?, watch_later=?, discarded=?, queue_position=?
       WHERE id=?
     `);
     this.db.exec("BEGIN IMMEDIATE");
@@ -217,6 +236,7 @@ export class SQLiteStore {
           task.playbackUpdatedAt || null,
           task.favorite ? 1 : 0,
           task.watchLater ? 1 : 0,
+          task.discarded ? 1 : 0,
           task.queuePosition !== null && task.queuePosition !== undefined && Number.isSafeInteger(Number(task.queuePosition)) ? Number(task.queuePosition) : null,
           row.id
         );
@@ -258,8 +278,8 @@ export class SQLiteStore {
         attempts, created_at, updated_at, data_json,
         media_status, media_size, media_checked_at,
         playback_position, playback_duration, watched, playback_updated_at,
-        favorite, watch_later, queue_position
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        favorite, watch_later, discarded, queue_position
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
         video_id=excluded.video_id, state=excluded.state, title=excluded.title,
         author=excluded.author, alias=excluded.alias, upload_time=excluded.upload_time,
@@ -273,6 +293,7 @@ export class SQLiteStore {
         playback_updated_at=excluded.playback_updated_at,
         favorite=excluded.favorite,
         watch_later=excluded.watch_later,
+        discarded=excluded.discarded,
         queue_position=excluded.queue_position
     `).run(
       task.id,
@@ -295,6 +316,7 @@ export class SQLiteStore {
       task.playbackUpdatedAt || null,
       task.favorite ? 1 : 0,
       task.watchLater ? 1 : 0,
+      task.discarded ? 1 : 0,
       task.queuePosition !== null && task.queuePosition !== undefined && Number.isSafeInteger(Number(task.queuePosition)) ? Number(task.queuePosition) : null
     );
     return data;
@@ -309,13 +331,11 @@ export class SQLiteStore {
     if (!changed.length) return;
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      for (const { task } of changed) {
-        const serialized = this.upsertTask(task);
-        this.snapshots.set(task.id, serialized);
-      }
+      const committed = changed.map(({ task }) => ({ id: task.id, serialized: this.upsertTask(task) }));
       this.db.exec("COMMIT");
+      for (const { id, serialized } of committed) this.snapshots.set(id, serialized);
     } catch (error) {
-      this.db.exec("ROLLBACK");
+      try { this.db.exec("ROLLBACK"); } catch { /* Preserve the original failure. */ }
       throw error;
     }
   }
@@ -341,11 +361,16 @@ export class SQLiteStore {
     );
   }
 
-  failedSourceHosts(taskId) {
+  sourceFailureCursor(taskId) {
+    return Number(this.db.prepare('SELECT COALESCE(MAX(id),0) AS cursor FROM attempt_events WHERE task_id=?').get(taskId).cursor);
+  }
+
+  failedSourceHosts(taskId, afterEventId = 0) {
     return this.db.prepare(`
       SELECT DISTINCT source_host FROM attempt_events
-      WHERE task_id=? AND outcome='failure' AND source_host<>''
-    `).all(taskId).map(row => row.source_host);
+      WHERE task_id=? AND id>? AND outcome='failure' AND source_host<>''
+        AND category='tls_certificate'
+    `).all(taskId, Math.max(0, Number(afterEventId) || 0)).map(row => row.source_host);
   }
 
   attemptHistory(taskId, limit = 50) {
@@ -387,7 +412,7 @@ export class SQLiteStore {
     const safePageSize = Math.min(200, Math.max(10, Number(pageSize) || 50));
     const safePage = Math.max(1, Number(page) || 1);
     const rows = this.db.prepare(`
-      SELECT data_json, favorite, watch_later, queue_position FROM tasks ${clause}
+      SELECT data_json, favorite, watch_later, discarded, queue_position FROM tasks ${clause}
       ORDER BY ${column} ${order}, id ASC LIMIT ? OFFSET ?
     `).all(...params, safePageSize, (safePage - 1) * safePageSize);
     return {
@@ -401,11 +426,13 @@ export class SQLiteStore {
   queryPlaylist({
     query = "", author = "all", watched = "all", sort = "updatedAt",
     direction = "desc", page = 1, pageSize = 30, randomPage = false,
-    favorite = "all", watchLater = "all", queue = "all",
-    contextId = "", contextIndex = null, contextSize = 5
+    randomSample = false, randomSeed = "",
+    favorite = "all", watchLater = "all", queue = "all", discarded = "exclude",
+    contextId = "", contextIndex = null, contextSize = 5, source = "all"
   } = {}) {
     const where = ["state='completed'", "media_status='present'", "COALESCE(json_extract(data_json, '$.destination'), '')<>''"];
     const params = [];
+    addPlaylistSource(source, where);
     if (query) {
       where.push("(title LIKE ? ESCAPE '\\' OR author LIKE ? ESCAPE '\\' OR alias LIKE ? ESCAPE '\\' OR video_id LIKE ? ESCAPE '\\' OR data_json LIKE ? ESCAPE '\\')");
       const escaped = `%${String(query).replace(/[\\%_]/g, "\\$&")}%`;
@@ -424,6 +451,8 @@ export class SQLiteStore {
     if (queue === "queued" || queue === "not_queued") {
       where.push(queue === "queued" ? "queue_position IS NOT NULL" : "queue_position IS NULL");
     }
+    if (discarded === "only") where.push("discarded=1");
+    else if (discarded !== "all") where.push("discarded=0");
     const clause = `WHERE ${where.join(" AND ")}`;
     const total = Number(this.db.prepare(`SELECT COUNT(*) AS count FROM tasks ${clause}`).get(...params).count);
     const orderColumns = {
@@ -461,7 +490,7 @@ export class SQLiteStore {
           hasPrevious = target > 0;
           hasNext = target < total - 1;
           safePage = 1;
-          const rows = this.db.prepare(`SELECT data_json, favorite, watch_later, queue_position FROM tasks ${clause} ORDER BY ${orderColumn} ${order}, id ${tieOrder} LIMIT ? OFFSET ?`).all(...params, size, offset);
+          const rows = this.db.prepare(`SELECT data_json, favorite, watch_later, discarded, queue_position FROM tasks ${clause} ORDER BY ${orderColumn} ${order}, id ${tieOrder} LIMIT ? OFFSET ?`).all(...params, size, offset);
           return { total, page: safePage, pageSize: size, currentIndex, globalIndex, hasPrevious, hasNext, tasks: rows.map(row => this.rowTask(row)) };
         }
       }
@@ -478,20 +507,37 @@ export class SQLiteStore {
         hasPrevious = before > 0;
         hasNext = before < total - 1;
         safePage = 1;
-        const rows = this.db.prepare(`SELECT data_json, favorite, watch_later, queue_position FROM tasks ${clause} ORDER BY ${orderColumn} ${order}, id ${tieOrder} LIMIT ? OFFSET ?`).all(...params, size, offset);
+        const rows = this.db.prepare(`SELECT data_json, favorite, watch_later, discarded, queue_position FROM tasks ${clause} ORDER BY ${orderColumn} ${order}, id ${tieOrder} LIMIT ? OFFSET ?`).all(...params, size, offset);
         return { total, page: safePage, pageSize: size, currentIndex, globalIndex, hasPrevious, hasNext, tasks: rows.map(row => this.rowTask(row)) };
       }
       return { total, page: 1, pageSize: Math.min(9, Math.max(2, Number(contextSize) || 5)), currentIndex: null, globalIndex: null, hasPrevious: false, hasNext: false, tasks: [] };
     }
+    if (randomSample) {
+      const rows = this.db.prepare(`SELECT data_json, favorite, watch_later, discarded, queue_position FROM tasks ${clause} ORDER BY id ASC`).all(...params);
+      const seed = String(randomSeed || randomUUID());
+      const tasks = shuffleWithSeed(rows, seed).slice(0, safePageSize).map(row => this.rowTask(row));
+      return {
+        total,
+        page: 1,
+        pageSize: safePageSize,
+        currentIndex: null,
+        globalIndex: null,
+        hasPrevious: false,
+        hasNext: false,
+        tasks
+      };
+    }
     const pageCount = Math.max(1, Math.ceil(total / safePageSize));
     safePage = randomPage ? 1 + Math.floor(Math.random() * pageCount) : Math.min(pageCount, safePage);
     offset = (safePage - 1) * safePageSize;
-    const rows = this.db.prepare(`SELECT data_json, favorite, watch_later, queue_position FROM tasks ${clause} ORDER BY ${orderColumn} ${order}, id ${tieOrder} LIMIT ? OFFSET ?`).all(...params, safePageSize, offset);
+    const rows = this.db.prepare(`SELECT data_json, favorite, watch_later, discarded, queue_position FROM tasks ${clause} ORDER BY ${orderColumn} ${order}, id ${tieOrder} LIMIT ? OFFSET ?`).all(...params, safePageSize, offset);
     return { total, page: safePage, pageSize: safePageSize, currentIndex, globalIndex, hasPrevious: offset > 0, hasNext: offset + rows.length < total, tasks: rows.map(row => this.rowTask(row)) };
   }
 
-  playlistTags({ limit = 18 } = {}) {
-    const rows = this.db.prepare("SELECT data_json FROM tasks WHERE state='completed' AND media_status='present' AND COALESCE(json_extract(data_json, '$.destination'), '')<>''").all();
+  playlistTags({ limit = 18, source = "all" } = {}) {
+    const where = ["state='completed'", "media_status='present'", "discarded=0", "COALESCE(json_extract(data_json, '$.destination'), '')<>''"];
+    addPlaylistSource(source, where);
+    const rows = this.db.prepare(`SELECT data_json FROM tasks WHERE ${where.join(" AND ")}`).all();
     const counts = new Map();
     for (const row of rows) {
       let data;
@@ -519,10 +565,21 @@ export class SQLiteStore {
     return counts;
   }
 
-  authors() {
+  authors(source = "all") {
+    const where = ["author<>''"];
+    addPlaylistSource(source, where);
     return this.db.prepare(`
       SELECT author, MAX(alias) AS alias, COUNT(*) AS count
-      FROM tasks WHERE author<>'' GROUP BY author ORDER BY author COLLATE NOCASE
+      FROM tasks WHERE ${where.join(" AND ")} GROUP BY author ORDER BY author COLLATE NOCASE
+    `).all();
+  }
+
+  playlistAuthors(source = "all") {
+    const where = ["author<>''", "state='completed'", "media_status='present'", "COALESCE(json_extract(data_json, '$.destination'), '')<>''"];
+    addPlaylistSource(source, where);
+    return this.db.prepare(`
+      SELECT author, MAX(alias) AS alias, COUNT(*) AS count
+      FROM tasks WHERE ${where.join(" AND ")} GROUP BY author ORDER BY author COLLATE NOCASE
     `).all();
   }
 
@@ -569,8 +626,8 @@ export class SQLiteStore {
     return this.db.prepare("SELECT value FROM meta WHERE key=?").get(key)?.value;
   }
 
-  async importExistingFiles(downloadRoot) {
-    const files = await walkMediaFiles(downloadRoot);
+  async importExistingFiles(downloadRoot, { deferLocal = false, files: selectedFiles = null, fingerprints = new Map() } = {}) {
+    const files = selectedFiles || await walkMediaFiles(downloadRoot);
     const existingIds = new Set(this.state.tasks.map(task => task.videoId));
     let imported = 0;
     let localImported = 0;
@@ -580,7 +637,9 @@ export class SQLiteStore {
       const info = await stat(filePath);
       const iwaraId = extractIwaraId(parsed.name);
       const localOnly = !iwaraId;
-      const videoId = iwaraId || localVideoId(filePath, downloadRoot, info.size);
+      if (localOnly && deferLocal) continue;
+      const digest = fingerprints.get(filePath);
+      const videoId = iwaraId || (digest ? `local-${digest.slice(0, 24)}` : localVideoId(filePath, downloadRoot, info.size));
       if (existingIds.has(videoId)) continue;
       const timestamp = info.mtime.toISOString();
       const task = {
@@ -623,22 +682,9 @@ export class SQLiteStore {
     return result;
   }
 
-  async createDailyBackup() {
-    const date = new Date().toISOString().slice(0, 10);
-    const target = path.join(this.backupRoot, `ledger-${date}.sqlite`);
-    try {
-      await stat(target);
-    } catch (error) {
-      if (error.code !== "ENOENT") throw error;
-      await sqliteBackup(this.db, target);
-    }
-    const backups = (await readdir(this.backupRoot))
-      .filter(name => /^ledger-\d{4}-\d{2}-\d{2}\.sqlite$/.test(name))
-      .sort()
-      .reverse();
-    for (const oldName of backups.slice(7)) {
-      await unlink(path.join(this.backupRoot, oldName));
-    }
+  async createDailyBackup(config = {}) {
+    this.backupManager ||= new BackupManager({ db: this.db, root: this.backupRoot, config });
+    return this.backupManager.runOnce();
   }
 
   close() {

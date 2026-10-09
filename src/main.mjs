@@ -10,10 +10,17 @@ import { Scheduler } from "./scheduler.mjs";
 import { FfmpegDownloader } from "./ffmpeg-downloader.mjs";
 import { TranscodeCache } from "./transcode-cache.mjs";
 import { createServer } from "./server.mjs";
+import { BackupManager } from "./backup-manager.mjs";
+import { LocalFileIdentity } from "./local-file-identity.mjs";
+import { MobileLibrary } from "./mobile-library.mjs";
+import { Han1meImporter } from "./han1me-importer.mjs";
+import { YoutubeDownloader } from "./youtube-downloader.mjs";
+import { defaultDownloadFilter } from "./download-filter.mjs";
 
 const appRoot = path.resolve(import.meta.dirname, "..");
 const defaultDataRoot = "F:\\IwaraVideos\\R18\\ServiceData";
 const defaultDownloadRoot = "F:\\Video";
+const defaultFallbackDownloadRoot = "F:\\Video";
 const defaultEngine = "C:\\Program Files\\MotrixNext\\motrix-next-engine.exe";
 const configOverride = String(process.env.IWARA_CONFIG_PATH || "").trim()
   ? path.resolve(String(process.env.IWARA_CONFIG_PATH).trim())
@@ -58,6 +65,12 @@ async function loadConfig() {
   const defaults = {
     dataRoot: envValue("IWARA_DATA_ROOT") || defaultDataRoot,
     downloadRoot: envValue("IWARA_DOWNLOAD_ROOT") || defaultDownloadRoot,
+    fallbackDownloadRoot: envValue("IWARA_FALLBACK_DOWNLOAD_ROOT") || defaultFallbackDownloadRoot,
+    downloadMinimumFreeBytes: 5 * 1024 * 1024 * 1024,
+    downloadFilter: defaultDownloadFilter(),
+    externalMediaRoots: [],
+    han1meDownloadRoot: "",
+    han1meHistoryRoots: [],
     enginePath: envValue("IWARA_ENGINE_PATH") || defaultEngine,
     serviceHost: "127.0.0.1",
     servicePort: 18777,
@@ -112,6 +125,7 @@ async function loadConfig() {
   const envOverrides = {
     dataRoot: "IWARA_DATA_ROOT",
     downloadRoot: "IWARA_DOWNLOAD_ROOT",
+    fallbackDownloadRoot: "IWARA_FALLBACK_DOWNLOAD_ROOT",
     enginePath: "IWARA_ENGINE_PATH",
     serviceHost: "IWARA_SERVICE_HOST",
     ffmpegPath: "IWARA_FFMPEG_PATH"
@@ -132,6 +146,32 @@ async function loadConfig() {
   }
   merged.dataRoot = path.resolve(appRoot, String(merged.dataRoot || defaultDataRoot));
   merged.downloadRoot = path.resolve(appRoot, String(merged.downloadRoot || defaultDownloadRoot));
+  merged.fallbackDownloadRoot = path.resolve(appRoot, String(merged.fallbackDownloadRoot || defaultFallbackDownloadRoot));
+  merged.externalMediaRoots = (Array.isArray(merged.externalMediaRoots) ? merged.externalMediaRoots : [])
+    .map(root => path.resolve(appRoot, String(root || "").trim()))
+    .filter(root => root !== merged.downloadRoot);
+  const detectedHan1meRoot = merged.externalMediaRoots.find(root => /han.?ime/i.test(path.basename(root))) || "";
+  merged.han1meDownloadRoot = String(merged.han1meDownloadRoot || "").trim()
+    ? path.resolve(appRoot, String(merged.han1meDownloadRoot).trim())
+    : detectedHan1meRoot;
+  if (merged.han1meDownloadRoot) {
+    merged.externalMediaRoots = [...new Set([...merged.externalMediaRoots, merged.han1meDownloadRoot])];
+  }
+  const configuredHistoryRoots = Array.isArray(merged.han1meHistoryRoots) ? merged.han1meHistoryRoots : [];
+  const historyRoots = [...configuredHistoryRoots, merged.han1meDownloadRoot]
+    .map(root => String(root || "").trim())
+    .filter(Boolean)
+    .map(root => path.resolve(appRoot, root));
+  merged.han1meHistoryRoots = [...new Map(
+    historyRoots.map(root => [root.toLocaleLowerCase("en-US"), root])
+  ).values()];
+  if (merged.fallbackDownloadRoot !== merged.downloadRoot) {
+    merged.externalMediaRoots = [...new Set([...merged.externalMediaRoots, merged.fallbackDownloadRoot])];
+  }
+  merged.externalMediaRoots = [...new Map(
+    [...merged.externalMediaRoots, ...merged.han1meHistoryRoots]
+      .map(root => [root.toLocaleLowerCase("en-US"), root])
+  ).values()];
   merged.enginePath = path.resolve(appRoot, String(merged.enginePath || defaultEngine));
   await mkdir(merged.dataRoot, { recursive: true });
   await mkdir(path.dirname(configPath), { recursive: true });
@@ -195,8 +235,20 @@ async function main() {
     backupRoot: path.join(dataRoot, "backups")
   });
   await store.load();
-  const importSummary = await store.importExistingFiles(config.downloadRoot);
+  store.fileIdentity = new LocalFileIdentity({ store, root: config.downloadRoot });
+  const mobileLibrary = new MobileLibrary({ store, root: config.downloadRoot, additionalRoots: config.externalMediaRoots, exportRoot: path.join(dataRoot, 'mobile-exports'), externalProgressFile: path.join(dataRoot, 'mobile-fingerprint-progress.json') });
+  const importSummary = await store.importExistingFiles(config.downloadRoot, { deferLocal: true });
   const ffmpeg = new FfmpegDownloader({ configuredPath: config.ffmpegPath || "" });
+  const youtubeDownloader = new YoutubeDownloader({
+    downloadRoot: config.downloadRoot,
+    archivePath: path.join(dataRoot, "youtube-download-archive.txt"),
+    configuredPath: config.ytDlpPath || envValue("IWARA_YTDLP_PATH"),
+    resolveFfmpeg: () => ffmpeg.resolveExecutable(),
+    onCompleted: async () => {
+      if (store.fileIdentity.pending) await store.fileIdentity.pending;
+      await store.fileIdentity.scan();
+    }
+  });
   const transcodeCache = config.remoteTranscodeEnabled === false ? null : new TranscodeCache({
     ffmpeg,
     root: path.join(dataRoot, "transcode-cache", "480p"),
@@ -210,13 +262,24 @@ async function main() {
     store,
     aria2,
     ffmpeg,
+    onCompleted: task => mobileLibrary.enqueueDownload(task),
     config: {
       ...config,
       stagingRoot: path.join(dataRoot, "staging")
     }
   });
   await scheduler.init();
-  await store.createDailyBackup();
+  const han1meImporter = new Han1meImporter({
+    store,
+    mobileLibrary,
+    root: config.han1meDownloadRoot,
+    roots: config.han1meHistoryRoots,
+    downloadFilter: config.downloadFilter,
+    onImported: () => { scheduler.mediaIndex = null; }
+  });
+  mobileLibrary.resumeDownloads();
+  store.fileIdentity.onPathsChanged = () => { scheduler.mediaIndex = null; };
+  store.backupManager = new BackupManager({ db: store.db, root: path.join(dataRoot, "backups"), config });
   scheduler.start();
   let stopping = false;
   let httpServer;
@@ -225,6 +288,10 @@ async function main() {
     stopping = true;
     scheduler.stop();
     await httpServer?.close();
+    await han1meImporter.stop();
+    await store.fileIdentity.stop();
+    await mobileLibrary.stop();
+    await store.backupManager.stop();
     if (engine) {
       try { await aria2.call("shutdown"); } catch {}
     }
@@ -238,9 +305,15 @@ async function main() {
     accessToken: config.lanAccessToken,
     ffmpeg,
     transcodeCache,
+    mobileLibrary,
+    han1meImporter,
+    youtubeDownloader,
     onShutdown: shutdown
   });
   await httpServer.listen();
+  store.backupManager.start();
+  han1meImporter.start();
+  void store.fileIdentity.scan();
   console.log(`Iwara 稳定下载队列：http://127.0.0.1:${config.servicePort}/`);
   if (!isLoopbackHost(config.serviceHost)) {
     const token = encodeURIComponent(String(config.lanAccessToken || ""));

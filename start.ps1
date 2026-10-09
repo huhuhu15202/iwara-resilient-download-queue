@@ -36,6 +36,11 @@ if (-not $env:IWARA_CONFIG_PATH -and -not (Test-Path -LiteralPath $configPath)) 
 }
 New-Item -ItemType Directory -Path $dataRoot -Force | Out-Null
 
+$startupTimeoutSeconds = 120
+$startupPollIntervalMs = 250
+$maxStartupAttempts = [math]::Ceiling($startupTimeoutSeconds * 1000 / $startupPollIntervalMs)
+$serviceProcess = $null
+
 try {
     Invoke-RestMethod -Uri "http://127.0.0.1:18777/health" -TimeoutSec 1 | Out-Null
 } catch {
@@ -56,29 +61,36 @@ try {
     if ($major -lt 22 -or ($major -eq 22 -and $minor -lt 13)) {
         throw "Node.js $nodeVersion is unsupported; this service needs >= 22.13.0. Install Node.js 24 LTS."
     }
-    Start-Process -FilePath $nodePath `
+    $serviceProcess = Start-Process -FilePath $nodePath `
         -ArgumentList "src\main.mjs" `
         -WorkingDirectory $appRoot `
         -WindowStyle Hidden `
         -RedirectStandardOutput (Join-Path $dataRoot "service.log") `
-        -RedirectStandardError (Join-Path $dataRoot "service-error.log")
+        -RedirectStandardError (Join-Path $dataRoot "service-error.log") `
+        -PassThru
 }
 
 $ready = $false
-for ($attempt = 0; $attempt -lt 40; $attempt++) {
+for ($attempt = 0; $attempt -lt $maxStartupAttempts; $attempt++) {
     try {
         Invoke-RestMethod -Uri "http://127.0.0.1:18777/health" -TimeoutSec 1 | Out-Null
         $ready = $true
         break
     } catch {
-        Start-Sleep -Milliseconds 250
+        if ($serviceProcess -and $serviceProcess.HasExited) { break }
+        Start-Sleep -Milliseconds $startupPollIntervalMs
     }
 }
 
 if ($ready) {
-    Start-Process "http://127.0.0.1:18777/"
+    Start-Process "http://127.0.0.1:18777/playlist"
 } else {
     Write-Host "Iwara queue failed to start. See:" -ForegroundColor Red
+    if ($serviceProcess -and $serviceProcess.HasExited) {
+        Write-Host "Node.js exited with code $($serviceProcess.ExitCode)."
+    } elseif ($serviceProcess) {
+        Write-Host "Node.js is still initializing; health check timed out after $startupTimeoutSeconds seconds."
+    }
     Write-Host (Join-Path $dataRoot "service-error.log")
     Read-Host "Press Enter to close"
     exit 1

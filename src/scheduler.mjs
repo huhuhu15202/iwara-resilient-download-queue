@@ -1,9 +1,14 @@
 import {
-  access, copyFile, mkdir, open, readFile, readdir, rename, rm, stat, unlink
+  access, copyFile, mkdir, open, readFile, readdir, rename, rm, stat, statfs, unlink
 } from "node:fs/promises";
 import path from "node:path";
+import { shuffleWithSeed } from "./seeded-random.mjs";
+import { classifyMediaSource, normalizeMediaSource } from "./media-source.mjs";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { classifyError, isPermanentErrorCategory, failurePolicy, safeFailureMessage, retryAfterDelay } from "./failure-policy.mjs";
+import { downloadFilterMessage, matchesDownloadFilter } from "./download-filter.mjs";
+export { classifyError, isPermanentErrorCategory } from "./failure-policy.mjs";
 
 function nowIso() {
   return new Date().toISOString();
@@ -45,6 +50,66 @@ function normalizeTags(value) {
   return result;
 }
 
+function queueMetadata(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const text = input => typeof input === "string"
+    ? input.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 300)
+    : "";
+  const metadata = {};
+  const title = text(value.title ?? value.Title);
+  const author = text(value.author ?? value.Author);
+  const alias = text(value.alias ?? value.Alias);
+  const rawDate = value.uploadTime ?? value.UploadTime;
+  let uploadTime = null;
+  if (typeof rawDate === "number" && Number.isFinite(rawDate) && rawDate > 0) {
+    const parsed = new Date(rawDate);
+    if (Number.isFinite(parsed.getTime())) uploadTime = parsed.toISOString();
+  } else if (typeof rawDate === "string" && rawDate.trim() && Number.isFinite(Date.parse(rawDate))) {
+    uploadTime = rawDate.trim().slice(0, 80);
+  }
+  const rawViews = value.viewCount ?? value.views ?? value.Views;
+  const views = rawViews == null || rawViews === "" ? null : Number(String(rawViews).replace(/[ ,]/g, ""));
+  const tagsPresent = Array.isArray(value.tags) || Array.isArray(value.Tags);
+  if (title) metadata.title = title;
+  if (author) metadata.author = author;
+  if (alias) metadata.alias = alias;
+  if (uploadTime) metadata.uploadTime = uploadTime;
+  if (Number.isSafeInteger(views) && views >= 0) metadata.viewCount = views;
+  if (tagsPresent) metadata.tags = normalizeTags(value.tags ?? value.Tags).map(tag => tag.slice(0, 120)).slice(0, 100);
+  return metadata;
+}
+
+function mergeMissingQueueMetadata(task, metadata) {
+  let changed = false;
+  if ((!task.title || task.title === task.videoId) && metadata.title) { task.title = metadata.title; changed = true; }
+  if (!String(task.author || "").trim() && metadata.author) {
+    task.author = metadata.author;
+    task.authorBackfillStatus = "complete";
+    task.authorBackfillLeaseId = null;
+    task.authorBackfillLeaseExpiresAt = null;
+    task.authorBackfillNextRunAt = 0;
+    task.authorBackfillMessage = "已在网页入队时保存作者资料";
+    changed = true;
+  }
+  if (!String(task.alias || "").trim() && metadata.alias) { task.alias = metadata.alias; changed = true; }
+  if (!task.uploadTime && metadata.uploadTime) { task.uploadTime = metadata.uploadTime; changed = true; }
+  if (task.viewCount == null && metadata.viewCount != null) {
+    task.viewCount = metadata.viewCount;
+    task.viewsUpdatedAt = nowIso();
+    changed = true;
+  }
+  if ((!Array.isArray(task.tags) || task.tags.length === 0) && metadata.tags) {
+    task.tags = metadata.tags;
+    task.tagsUpdatedAt = nowIso();
+    changed = true;
+  }
+  if (changed) {
+    task.metadataSource ||= "iwara_page_enqueue";
+    task.updatedAt = nowIso();
+  }
+  return changed;
+}
+
 function readTagField(metadata = {}) {
   if (!metadata || typeof metadata !== "object") return { present: false, value: undefined };
   if (metadata.tagsFieldPresent === false) return { present: false, value: undefined };
@@ -77,12 +142,51 @@ function taskNeedsViews(task) {
 }
 
 function taskNeedsBaseMetadata(task, importedMetadataEnrichmentEnabled = true) {
+  if (task?.baseMetadataRequested === true) return true;
   if (task?.imported && importedMetadataEnrichmentEnabled === false) return false;
-  return !task?.author || !task?.uploadTime;
+  return !String(task?.author || "").trim() || String(task?.author || "").trim() === "本地导入" || !task?.uploadTime;
+}
+
+function isIwaraMetadataTask(task) {
+  if (!task || task.localOnly || String(task.videoId || "").startsWith("han1meview-")) return false;
+  if (!/^[A-Za-z0-9_-]{10,24}$/.test(String(task.videoId || ""))) return false;
+  try {
+    const source = new URL(task.sourcePage || "");
+    const sourceId = source.pathname.match(/^\/video\/([A-Za-z0-9_-]{10,24})\/?$/)?.[1];
+    return source.protocol === "https:" && ["iwara.tv", "www.iwara.tv"].includes(source.hostname.toLowerCase()) && sourceId === task.videoId;
+  } catch {
+    return false;
+  }
+}
+
+function queueMissingIwaraMetadata(task) {
+  const genericAuthor = String(task?.author || "").trim() === "本地导入";
+  if (!isIwaraMetadataTask(task) || (!taskNeedsBaseMetadata(task, true) && !genericAuthor)) return false;
+
+  // A successful sniff can recover the media URL even when the page/API
+  // metadata lookup failed. Keep the completed media and put its missing
+  // author/date back into the existing bounded metadata queue.
+  task.baseMetadataRequested = true;
+  if (task.metadataStatus === "failed") {
+    task.metadataMessage ||= "下载完成，但作者或上传日期仍缺失；资料同步已达到重试上限，请手动重试";
+    return false;
+  }
+  const alreadyRetrying = task.metadataStatus === "retry";
+  if (!alreadyRetrying) {
+    task.metadataStatus = "pending";
+    task.metadataAttempts = Number.isSafeInteger(Number(task.metadataAttempts)) ? Number(task.metadataAttempts) : 0;
+    task.metadataNextRunAt = 0;
+    task.metadataLeaseId = null;
+    task.metadataLeaseExpiresAt = null;
+    task.metadataMessage = "下载已完成，等待补齐 Iwara 作者或上传日期";
+  } else {
+    task.metadataMessage ||= "下载已完成，等待重试补齐 Iwara 作者或上传日期";
+  }
+  return true;
 }
 
 function publicTask(task) {
-  const { resolved, leaseId, metadataLeaseId, stagingFile, gid, ...safe } = task;
+  const { resolved, leaseId, metadataLeaseId, authorBackfillLeaseId, authorBackfillLeaseExpiresAt, stagingFile, gid, ...safe } = task;
   safe.tags = normalizeTags(safe.tags);
   return safe;
 }
@@ -124,24 +228,6 @@ function sanitizeForwardHeaders(headers = {}) {
     safe[headerName] = headerValue;
   }
   return safe;
-}
-
-export function classifyError(message) {
-  const text = String(message || "").toLowerCase();
-  if (/80090322|sec_e_wrong_principal|wrong principal|target principal|目标主要名称|hostname mismatch|certificate.*(?:host|name)|sni/.test(text)) return "tls_certificate";
-  if (/80090326|sec_e_illegal_message|ssl|tls|handshake|schannel|握手/.test(text)) return "tls_handshake";
-  if (/\b404\b|not found|不存在|deleted/.test(text)) return "not_found";
-  if (/\b403\b|forbidden|expired|过期/.test(text)) return "access_or_expired";
-  if (/timeout|timed out|超时|无进度/.test(text)) return "timeout";
-  if (/network|fetch|connect|socket|网络/.test(text)) return "network";
-  if (/private|permission|unauthorized|权限|登录/.test(text)) return "permission";
-  if (/所有可用 cdn 源均已失败|all available cdn/.test(text)) return "source_exhausted";
-  if (/quality|source|画质|视频源/.test(text)) return "source_unavailable";
-  return "unknown";
-}
-
-export function isPermanentErrorCategory(category) {
-  return category === "not_found" || category === "access_or_expired";
 }
 
 function aria2FailureMessage(status) {
@@ -229,12 +315,16 @@ async function availableDestination(requested) {
 }
 
 export class Scheduler {
-  constructor({ store, aria2, ffmpeg = null, config, clock = Date }) {
+  constructor({ store, aria2, ffmpeg = null, config, clock = Date, httpRequest = globalThis.fetch, onCompleted = null, diskSpaceProvider = statfs, volumeKeyProvider = value => path.parse(path.resolve(value)).root.toLocaleLowerCase() }) {
     this.store = store;
     this.aria2 = aria2;
     this.ffmpeg = ffmpeg;
     this.config = config;
     this.clock = clock;
+    this.httpRequest = httpRequest;
+    this.onCompleted = onCompleted;
+    this.diskSpaceProvider = diskSpaceProvider;
+    this.volumeKeyProvider = volumeKeyProvider;
     this.timer = null;
     this.reconcileTimer = null;
     this.reconcileCursor = 0;
@@ -390,6 +480,14 @@ export class Scheduler {
         task.metadataLeaseId ||= null;
         task.metadataLeaseExpiresAt ||= null;
       }
+      if (["queued", "resolving"].includes(task.state)) {
+        const filterMatch = this.downloadFilterMatch(task);
+        if (filterMatch) {
+          this.markTaskFiltered(task, filterMatch);
+          await this.store.save();
+          continue;
+        }
+      }
       if (task.state === "completed") {
         await this.verifyCompletedTask(task);
         continue;
@@ -466,6 +564,7 @@ export class Scheduler {
   }
 
   async reconcileMediaBatch() {
+    void this.store.fileIdentity?.scan();
     const completed = this.store.state.tasks.filter(task => task.state === "completed" && task.destination);
     if (!completed.length) return { checked: 0, changed: 0 };
     const batchSize = Math.max(1, Number(this.config.mediaReconcileBatchSize || 50));
@@ -510,22 +609,68 @@ export class Scheduler {
     return this.activeDownloadCount() + this.activeMetadataCount();
   }
 
+  downloadFilterMatch(value) {
+    return matchesDownloadFilter(value, this.config.downloadFilter);
+  }
+
+  markTaskFiltered(task, match) {
+    const message = downloadFilterMessage(match);
+    task.state = "filtered";
+    task.filterBlocked = true;
+    task.filterMatch = match;
+    task.lastErrorCategory = "download_filtered";
+    task.message = `${message}；未启动下载`;
+    task.leaseId = null;
+    task.leaseExpiresAt = null;
+    task.resolveMode = null;
+    task.gid = null;
+    task.downloadEngine = null;
+    task.resolved = null;
+    task.updatedAt = nowIso();
+    this.store.recordAttempt?.(task, {
+      phase: "download_filter",
+      outcome: "blocked",
+      category: "download_filtered",
+      message
+    });
+    return publicTask(task);
+  }
+
   async enqueue(items) {
     const accepted = [];
     const ignored = [];
     for (const item of items) {
-      const videoId = String(item.videoId || "").trim();
+      const request = item && typeof item === "object" && !Array.isArray(item) ? item : {};
+      const videoId = String(request.videoId || "").trim();
       if (!/^[A-Za-z0-9_-]{3,128}$/.test(videoId)) {
         ignored.push({ videoId, reason: "invalid videoId" });
         continue;
       }
+      const metadata = queueMetadata(request.metadata);
+      const filterMatch = this.downloadFilterMatch({
+        videoId,
+        sourcePlatform: request.sourcePlatform,
+        metadata: request.metadata,
+        tags: request.tags
+      });
+      if (filterMatch) {
+        const duplicate = this.store.state.tasks.find(task => task.videoId === videoId);
+        if (duplicate && ["queued", "resolving"].includes(duplicate.state)) {
+          this.markTaskFiltered(duplicate, filterMatch);
+          await this.store.save();
+        }
+        ignored.push({ videoId, reason: downloadFilterMessage(filterMatch), filtered: true });
+        continue;
+      }
       const duplicate = this.store.state.tasks.find(task => task.videoId === videoId);
       if (duplicate) {
+        const metadataUpdated = mergeMissingQueueMetadata(duplicate, metadata);
         ignored.push({
           videoId,
           reason: `already recorded: ${duplicate.state}`,
           state: duplicate.state,
-          taskId: duplicate.id
+          taskId: duplicate.id,
+          ...(metadataUpdated ? { metadataUpdated: true } : {})
         });
         continue;
       }
@@ -533,6 +678,14 @@ export class Scheduler {
         id: randomUUID(),
         videoId,
         sourcePage: `https://www.iwara.tv/video/${videoId}`,
+        title: metadata.title || "",
+        author: metadata.author || "",
+        alias: metadata.alias || "",
+        uploadTime: metadata.uploadTime || null,
+        viewCount: metadata.viewCount ?? null,
+        views: metadata.viewCount ?? null,
+        ...(metadata.tags ? { tags: metadata.tags, tagsUpdatedAt: nowIso() } : {}),
+        ...(Object.keys(metadata).length ? { metadataSource: "iwara_page_enqueue" } : {}),
         state: "queued",
         attempts: 0,
         resolveFailures: 0,
@@ -545,6 +698,7 @@ export class Scheduler {
         browserFallbackPending: false,
         browserFallbackAttempted: false
       };
+      if (metadata.viewCount != null) task.viewsUpdatedAt = nowIso();
       this.store.state.tasks.push(task);
       accepted.push(publicTask(task));
     }
@@ -556,6 +710,15 @@ export class Scheduler {
     // Metadata enrichment has its own pool and must never consume a download
     // slot. This keeps three actual downloads running whenever work exists.
     if (this.activeDownloadCount() >= this.maxConcurrentTasks()) return null;
+    let filteredQueued = false;
+    for (const candidate of this.store.state.tasks) {
+      if (candidate.state !== "queued") continue;
+      const filterMatch = this.downloadFilterMatch(candidate);
+      if (!filterMatch) continue;
+      this.markTaskFiltered(candidate, filterMatch);
+      filteredQueued = true;
+    }
+    if (filteredQueued) await this.store.save();
     const now = this.clock.now();
     const task = this.store.state.tasks.find(
       item => item.state === "queued" && (item.nextRunAt || 0) <= now
@@ -585,13 +748,13 @@ export class Scheduler {
       mode,
       attempt: task.attempts + 1,
       sniffTimeoutMs: this.config.browserFallbackTimeoutMs || 45_000,
-      avoidHosts: mode === "api" ? (this.store.failedSourceHosts?.(task.id) || []) : []
+      avoidHosts: mode === "api" ? (this.store.failedSourceHosts?.(task.id, task.sourceFailureCursor || 0) || []) : []
     };
   }
 
-  async submitResolution({ taskId, leaseId, ok, video, error, partialMetadata }) {
+  async submitResolution({ taskId, leaseId, ok, video, error, partialMetadata, failure }) {
     const task = this.store.state.tasks.find(item => item.id === taskId);
-    if (!task || task.state !== "resolving" || task.leaseId !== leaseId) {
+    if (!task || task.state !== "resolving" || task.leaseId !== leaseId || (task.leaseExpiresAt && this.clock.now() >= task.leaseExpiresAt)) {
       throw new Error("解析租约无效或已过期");
     }
     const resolveMode = task.resolveMode || "api";
@@ -605,39 +768,31 @@ export class Scheduler {
     }
     if (!ok || !video?.url) {
       task.resolveFailures += 1;
-      const message = error || (resolveMode === "browser_sniff" ? "网页嗅探失败" : "浏览器解析失败");
-      const category = classifyError(message);
+      const message = safeFailureMessage(error || (resolveMode === "browser_sniff" ? "网页嗅探失败" : "浏览器解析失败"));
+      const policy = failurePolicy(message, failure, resolveMode === "browser_sniff" ? "browser_sniff" : "unknown");
+      const { category } = policy;
       task.lastErrorCategory = category;
+      task.lastFailure = policy;
       this.store.recordAttempt?.(task, {
         phase: resolveMode === "browser_sniff" ? "browser_sniff" : "resolve",
         outcome: "failure", category, message
       });
-      // 页面明确返回 403/私人视频或不存在时，继续重试没有意义；
-      // 终止并保留台账，让用户可以清楚区分权限/页面问题与临时 CDN 故障。
-      if (isPermanentErrorCategory(category)) {
+      // Only structured video-API evidence may stop the task immediately.
+      // CDN/source errors and legacy strings must keep the bounded retry path.
+      if (policy.permanent) {
+        task.attempts += 1;
         task.state = "failed";
         task.browserFallbackPending = false;
         task.browserFallbackAttempted = true;
-        task.message = `${message}；已确认无法下载，停止重试`;
-        task.updatedAt = nowIso();
-        await this.store.save();
-        return publicTask(task);
-      }
-      // 连续多次仅得到无媒体源（例如页面只有 YouTube 嵌入）时，
-      // 视为当前账号/页面无法提供 Iwara Source，停止无意义的无限重试。
-      // 网络/CDN 类错误仍按原策略重试。
-      if (category === "source_unavailable" && (task.attempts >= 4 || task.resolveFailures >= 20)) {
-        task.state = "failed";
-        task.browserFallbackPending = false;
-        task.browserFallbackAttempted = true;
-        task.message = `${message}；已连续多次无可用 Source，停止重试`;
+        task.message = `${message}；${category === "video_missing" ? "视频资料接口确认不存在" : "视频资料接口确认当前账号无权限"}，停止本轮重试`;
         task.updatedAt = nowIso();
         await this.store.save();
         return publicTask(task);
       }
       return this.retryOrFail(task, message, false, {
         fallbackFailure: resolveMode === "browser_sniff",
-        forceFallback: resolveMode !== "browser_sniff" && category === "source_exhausted"
+        forceFallback: resolveMode !== "browser_sniff" && category === "source_exhausted",
+        retryAfterMs: policy.retryAfterMs
       });
     }
 
@@ -647,19 +802,9 @@ export class Scheduler {
       this.store.recordAttempt?.(task, {
         phase: "browser_sniff", outcome: "failure", category: "source_unavailable", message
       });
-      if (task.attempts >= 4 || task.resolveFailures >= 20) {
-        task.state = "failed";
-        task.browserFallbackPending = false;
-        task.browserFallbackAttempted = true;
-        task.message = `${message}；已连续多次无可用 Source，停止重试`;
-        task.updatedAt = nowIso();
-        await this.store.save();
-        return publicTask(task);
-      }
       return this.retryOrFail(task, message, false, { fallbackFailure: true });
     }
 
-    task.attempts += 1;
     task.title = video.metadata?.Title || video.title || task.title || task.videoId;
     task.author = video.metadata?.Author || task.author || "";
     task.alias = video.metadata?.Alias || task.alias || "";
@@ -669,6 +814,18 @@ export class Scheduler {
       task.tags = normalizeTags(metadataTags(video.metadata));
       task.tagsUpdatedAt = nowIso();
     }
+    const filterMatch = this.downloadFilterMatch({
+      videoId: task.videoId,
+      sourcePlatform: task.sourcePlatform,
+      metadata: video.metadata,
+      tags: task.tags
+    });
+    if (filterMatch) {
+      this.markTaskFiltered(task, filterMatch);
+      await this.store.save();
+      return publicTask(task);
+    }
+    task.attempts += 1;
     const requestedFile = video.fileName || video.relativePath || task.preferredRelativePath || `${task.videoId}.mp4`;
     const forwardHeaders = sanitizeForwardHeaders(video.headers || {});
     if (video.referer && !forwardHeaders.Referer) forwardHeaders.Referer = video.referer;
@@ -784,6 +941,217 @@ export class Scheduler {
     };
   }
 
+  async queueAuthorBackfill({ limit = 0, retryFailed = false } = {}) {
+    const queuedStates = new Set(["pending", "retry", "enriching", "complete"]);
+    const candidates = this.store.state.tasks.filter(task => {
+      if (task.localOnly || task.state !== "completed" || !task.destination || task.discarded) return false;
+      if (String(task.author || "").trim() || String(task.alias || "").trim()) return false;
+      if (!/^[A-Za-z0-9_-]{10,24}$/.test(String(task.videoId || ""))) return false;
+      try {
+        const source = new URL(task.sourcePage || "");
+        if (source.protocol !== "https:" || !["iwara.tv", "www.iwara.tv"].includes(source.hostname.toLowerCase())) return false;
+        const sourceId = source.pathname.match(/^\/video\/([A-Za-z0-9_-]{10,24})\/?$/)?.[1];
+        if (!sourceId || sourceId !== task.videoId) return false;
+      } catch { return false; }
+      if (queuedStates.has(task.authorBackfillStatus)) return false;
+      return retryFailed || task.authorBackfillStatus !== "failed";
+    }).sort((a, b) => String(a.completedAt || a.id).localeCompare(String(b.completedAt || b.id)));
+    const max = Math.min(5000, Math.max(0, Number(limit) || 0));
+    const selected = max ? candidates.slice(0, max) : candidates;
+    for (const task of selected) {
+      task.authorBackfillStatus = "pending";
+      task.authorBackfillAttempts = 0;
+      task.authorBackfillNextRunAt = 0;
+      task.authorBackfillLeaseId = null;
+      task.authorBackfillLeaseExpiresAt = null;
+      task.authorBackfillMessage = "等待 Iwara 页面脚本补齐作者";
+    }
+    await this.store.save();
+    return { queued: selected.length, remaining: Math.max(0, candidates.length - selected.length), totalEligible: candidates.length };
+  }
+
+  async pauseAuthorBackfill() {
+    let paused = 0;
+    for (const task of this.store.state.tasks) {
+      if (!task.authorBackfillStatus || !["pending", "retry", "enriching"].includes(task.authorBackfillStatus)) continue;
+      task.authorBackfillStatus = "paused";
+      task.authorBackfillLeaseId = null;
+      task.authorBackfillLeaseExpiresAt = null;
+      task.authorBackfillNextRunAt = 0;
+      task.authorBackfillMessage = "按用户要求暂停作者补齐；原台账记录保留";
+      paused += 1;
+    }
+    if (paused) await this.store.save();
+    return { paused };
+  }
+
+  async backfillAuthorsFromFolders({ apply = false } = {}) {
+    const root = path.resolve(this.config.downloadRoot);
+    const knownAuthors = new Map();
+    const aliasOwners = new Map();
+    const folderAliases = new Map();
+    const normalizeLabel = value => String(value || "").trim().replace(/\s+/g, "").toLocaleLowerCase();
+    for (const task of this.store.state.tasks) {
+      if (task.state !== "completed" || task.localOnly || !task.destination || task.discarded || String(task.author || "").trim()) continue;
+      const relative = path.relative(root, path.resolve(task.destination));
+      if (!relative || relative === "." || path.isAbsolute(relative) || relative === ".." || relative.startsWith(`..${path.sep}`)) continue;
+      const segments = relative.split(/[\\/]+/).filter(Boolean);
+      if (segments.length < 2) continue;
+      const folder = segments[0].trim();
+      const alias = String(task.alias || "").trim();
+      if (!folder || !alias) continue;
+      const values = folderAliases.get(folder.toLocaleLowerCase()) || new Set();
+      values.add(alias);
+      folderAliases.set(folder.toLocaleLowerCase(), values);
+    }
+    for (const task of this.store.state.tasks) {
+      const author = String(task.author || "").trim();
+      if (!author) continue;
+      const alias = String(task.alias || "").trim();
+      knownAuthors.set(author.toLocaleLowerCase(), { author, alias });
+      if (alias) {
+        const key = alias.toLocaleLowerCase();
+        const owners = aliasOwners.get(key) || new Map();
+        owners.set(author.toLocaleLowerCase(), { author, alias });
+        aliasOwners.set(key, owners);
+      }
+    }
+    const excludedFolders = new Set(["video", "servicedata", "multiple", "various", "unknown", "uncategorized", "other"]);
+    const counts = { eligible: 0, matchedUsername: 0, matchedAlias: 0, matchedFolderAlias: 0, matchedConsensusAlias: 0, folderLabelOnly: 0, skippedRoot: 0, skippedOutsideRoot: 0, skippedGenericFolder: 0, skippedAmbiguousAlias: 0, skippedMissingFile: 0 };
+    const byFolder = {};
+    const updates = [];
+    for (const task of this.store.state.tasks) {
+      if (task.state !== "completed" || task.localOnly || !task.destination || task.discarded) continue;
+      if (String(task.author || "").trim()) continue;
+      const destination = path.resolve(task.destination);
+      const relative = path.relative(root, destination);
+      if (!relative || relative === ".") { counts.skippedRoot += 1; continue; }
+      if (path.isAbsolute(relative) || relative === ".." || relative.startsWith(`..${path.sep}`)) {
+        counts.skippedOutsideRoot += 1;
+        continue;
+      }
+      const segments = relative.split(/[\\/]+/).filter(Boolean);
+      if (segments.length < 2) { counts.skippedRoot += 1; continue; }
+      const folder = segments[0].trim();
+      if (!folder) { counts.skippedGenericFolder += 1; continue; }
+      const folderKey = folder.toLocaleLowerCase();
+      const taskAlias = String(task.alias || "").trim();
+      const aliasesInFolder = folderAliases.get(folderKey);
+      const consensusAlias = aliasesInFolder?.size === 1 ? aliasesInFolder.values().next().value : "";
+      const folderAliasMatch = Boolean(taskAlias && normalizeLabel(taskAlias) === normalizeLabel(folder));
+      const consensusAliasMatch = Boolean(folderKey === "multiple" && taskAlias && consensusAlias && normalizeLabel(taskAlias) === normalizeLabel(consensusAlias));
+      const isGenericFolder = excludedFolders.has(folderKey);
+      if (isGenericFolder && !(folderKey === "multiple" && consensusAliasMatch && aliasesInFolder.size === 1)) {
+        counts.skippedGenericFolder += 1;
+        continue;
+      }
+      if (taskAlias && !folderAliasMatch && !consensusAliasMatch && !isGenericFolder) {
+        counts.skippedAmbiguousAlias += 1;
+        continue;
+      }
+      const info = await stat(destination).catch(() => null);
+      if (!info?.isFile()) { counts.skippedMissingFile += 1; continue; }
+      const usernameMatch = knownAuthors.get(folderKey);
+      const aliasMatches = aliasOwners.get(folderKey);
+      let author = "";
+      let alias = taskAlias || folder;
+      let kind = "folderLabelOnly";
+      if (usernameMatch) {
+        author = usernameMatch.author;
+        alias = usernameMatch.alias || usernameMatch.author;
+        kind = "matchedUsername";
+      } else if (aliasMatches?.size === 1) {
+        const known = aliasMatches.values().next().value;
+        author = known.author;
+        alias = known.alias || folder;
+        kind = "matchedAlias";
+      } else if (folderAliasMatch) {
+        author = taskAlias;
+        kind = "matchedFolderAlias";
+      } else if (consensusAliasMatch && folderKey === "multiple") {
+        author = taskAlias;
+        kind = "matchedConsensusAlias";
+      }
+      counts.eligible += 1;
+      counts[kind] += 1;
+      byFolder[folder] = (byFolder[folder] || 0) + 1;
+      updates.push({ task, author, alias, source: kind === "folderLabelOnly" ? "local_folder_label" : `local_folder_${kind}` });
+    }
+    if (apply && updates.length) {
+      for (const { task, author, alias, source } of updates) {
+        if (author && !String(task.author || "").trim()) task.author = author;
+        if (!String(task.alias || "").trim()) task.alias = alias;
+        task.authorSource = source;
+      }
+      await this.store.save();
+    }
+    return { applied: Boolean(apply), ...counts, byFolder };
+  }
+
+  async leaseAuthorBackfill() {
+    const now = this.clock.now();
+    const tasks = this.store.state.tasks;
+    let reclaimed = false;
+    for (const task of tasks) {
+      if (task.authorBackfillStatus === "enriching" && (task.authorBackfillLeaseExpiresAt || 0) <= now) {
+        task.authorBackfillStatus = "retry";
+        task.authorBackfillLeaseId = null;
+        task.authorBackfillLeaseExpiresAt = null;
+        task.authorBackfillNextRunAt = now;
+        task.authorBackfillMessage = "作者补齐租约过期，等待重试";
+        reclaimed = true;
+      }
+    }
+    if (reclaimed) await this.store.save();
+    const active = this.activeMetadataCount() + tasks.filter(task => task.authorBackfillStatus === "enriching").length;
+    if (active >= this.maxConcurrentMetadataTasks()) return null;
+    const waitingDownload = tasks.some(item => item.state === "queued" && (item.nextRunAt || 0) <= now);
+    if (waitingDownload) return null;
+    const task = tasks.find(item => item.authorBackfillStatus && ["pending", "retry"].includes(item.authorBackfillStatus) &&
+      (item.authorBackfillNextRunAt || 0) <= now && item.state === "completed" && !item.localOnly && item.destination &&
+      !String(item.author || "").trim() && !String(item.alias || "").trim());
+    if (!task) return null;
+    task.authorBackfillStatus = "enriching";
+    task.authorBackfillLeaseId = randomUUID();
+    task.authorBackfillLeaseExpiresAt = now + this.config.leaseMs;
+    task.authorBackfillMessage = `正在补齐作者（第 ${(task.authorBackfillAttempts || 0) + 1} 次）`;
+    await this.store.save();
+    return { taskId: task.id, leaseId: task.authorBackfillLeaseId, videoId: task.videoId, attempt: (task.authorBackfillAttempts || 0) + 1 };
+  }
+
+  async submitAuthorBackfill({ taskId, leaseId, ok, author = "", alias = "", error = "", permanent = false }) {
+    const task = this.store.state.tasks.find(item => item.id === taskId);
+    if (!task || task.authorBackfillStatus !== "enriching" || task.authorBackfillLeaseId !== leaseId) {
+      throw new Error("作者补齐租约无效或已过期");
+    }
+    task.authorBackfillLeaseId = null;
+    task.authorBackfillLeaseExpiresAt = null;
+    task.authorBackfillAttempts = (task.authorBackfillAttempts || 0) + 1;
+    const safeAuthor = String(author || "").trim().slice(0, 200);
+    const safeAlias = String(alias || "").trim().slice(0, 200);
+    if (ok && (safeAuthor || safeAlias)) {
+      if (!String(task.author || "").trim() && safeAuthor) task.author = safeAuthor;
+      if (!String(task.alias || "").trim() && safeAlias) task.alias = safeAlias;
+      task.authorBackfillStatus = "complete";
+      task.authorBackfillNextRunAt = 0;
+      task.authorBackfillMessage = "已从 Iwara 视频资料补齐作者";
+    } else {
+      const maxAttempts = this.config.metadataMaxAttempts ?? 3;
+      const message = String(error || "Iwara 返回的数据没有作者字段").slice(0, 500);
+      if (permanent || task.authorBackfillAttempts >= maxAttempts) {
+        task.authorBackfillStatus = "failed";
+        task.authorBackfillNextRunAt = 0;
+        task.authorBackfillMessage = `${message}；保留原记录`;
+      } else {
+        task.authorBackfillStatus = "retry";
+        task.authorBackfillNextRunAt = this.clock.now() + (this.config.metadataRetryDelayMs ?? 60_000);
+        task.authorBackfillMessage = `${message}；稍后重试`;
+      }
+    }
+    await this.store.save();
+    return publicTask(task);
+  }
+
   async submitMetadataEnrichment({
     taskId, leaseId, ok, metadata, error, permanent = false
   }) {
@@ -799,9 +1167,10 @@ export class Scheduler {
       const requestedViews = task.viewCountRequested === true;
       const requestedTags = task.tagsRequested === true;
       task.title = metadata.title || task.title || task.videoId;
-      task.author = metadata.author || task.author || "";
+      task.author = metadata.author || (String(task.author || "").trim() === "本地导入" ? "" : task.author) || "";
       task.alias = metadata.alias || task.alias || "";
       task.uploadTime = metadata.uploadTime || task.uploadTime || null;
+      if (task.baseMetadataRequested && task.author && task.uploadTime) task.baseMetadataRequested = false;
       const baseMetadataNeeded = taskNeedsBaseMetadata(task, this.importedMetadataEnrichmentEnabled());
       const fetchedViews = metadata.views ?? metadata.viewCount ?? metadata.Views ?? null;
       let fetchedValidViews = false;
@@ -880,7 +1249,8 @@ export class Scheduler {
   async queueViewCountEnrichment(limit = 0) {
     const max = Math.min(5000, Math.max(0, Number(limit) || 0));
     const candidates = this.store.state.tasks
-      .filter(task => !task.localOnly && task.state === "completed" && task.destination && task.viewCount == null &&
+      .filter(task => isIwaraMetadataTask(task) && task.state === "completed" && task.destination && task.viewCount == null &&
+        task.metadataStatus !== "enriching" &&
         !(task.viewCountRequested && ["pending", "retry", "enriching", "failed"].includes(task.metadataStatus)))
       .sort((a, b) => String(a.updatedAt || a.completedAt || a.id).localeCompare(String(b.updatedAt || b.completedAt || b.id)));
     const selected = max ? candidates.slice(0, max) : candidates;
@@ -901,7 +1271,7 @@ export class Scheduler {
   async refreshViewCountEnrichment(limit = 0) {
     const max = Math.min(5000, Math.max(0, Number(limit) || 0));
     const candidates = this.store.state.tasks
-      .filter(task => !task.localOnly && task.state === "completed" && task.destination && task.metadataStatus !== "enriching")
+      .filter(task => isIwaraMetadataTask(task) && task.state === "completed" && task.destination && task.metadataStatus !== "enriching")
       .sort((a, b) => String(a.updatedAt || a.completedAt || a.id).localeCompare(String(b.updatedAt || b.completedAt || b.id)));
     const selected = max ? candidates.slice(0, max) : candidates;
     for (const task of selected) {
@@ -921,7 +1291,7 @@ export class Scheduler {
   async queueTagEnrichment(limit = 0) {
     const max = Math.min(5000, Math.max(0, Number(limit) || 0));
     const candidates = this.store.state.tasks
-      .filter(task => !task.localOnly && task.state === "completed" && task.destination && !task.tagsUpdatedAt &&
+      .filter(task => isIwaraMetadataTask(task) && task.state === "completed" && task.destination && !task.tagsUpdatedAt &&
         task.metadataStatus !== "enriching")
       .sort((a, b) => String(a.updatedAt || a.completedAt || a.id).localeCompare(String(b.updatedAt || b.completedAt || b.id)));
     const selected = max ? candidates.slice(0, max) : candidates;
@@ -943,7 +1313,7 @@ export class Scheduler {
   async refreshTagEnrichment(limit = 0) {
     const max = Math.min(5000, Math.max(0, Number(limit) || 0));
     const candidates = this.store.state.tasks
-      .filter(task => !task.localOnly && task.state === "completed" && task.destination && task.metadataStatus !== "enriching")
+      .filter(task => isIwaraMetadataTask(task) && task.state === "completed" && task.destination && task.metadataStatus !== "enriching")
       .sort((a, b) => String(a.updatedAt || a.completedAt || a.id).localeCompare(String(b.updatedAt || b.completedAt || b.id)));
     const selected = max ? candidates.slice(0, max) : candidates;
     for (const task of selected) {
@@ -961,7 +1331,28 @@ export class Scheduler {
     return { queued: selected.length, remaining: Math.max(0, candidates.length - selected.length) };
   }
 
-  async retryOrFail(task, message, countedAttempt, { fallbackFailure = false, forceFallback = false, permanent = false } = {}) {
+  async queueBaseMetadataEnrichment(limit = 0) {
+    const max = Math.min(5000, Math.max(0, Number(limit) || 0));
+    const candidates = this.store.state.tasks
+      .filter(task => isIwaraMetadataTask(task) && task.state === "completed" && task.destination &&
+        taskNeedsBaseMetadata(task, true) && task.baseMetadataRequested !== true && task.metadataStatus !== "enriching")
+      .sort((a, b) => String(a.updatedAt || a.completedAt || a.id).localeCompare(String(b.updatedAt || b.completedAt || b.id)));
+    const selected = max ? candidates.slice(0, max) : candidates;
+    for (const task of selected) {
+      task.baseMetadataRequested = true;
+      task.metadataStatus = "pending";
+      task.metadataAttempts = 0;
+      task.metadataNextRunAt = 0;
+      task.metadataLeaseId = null;
+      task.metadataLeaseExpiresAt = null;
+      task.metadataMessage = "等待同步缺失的作者或上传日期";
+      task.updatedAt = nowIso();
+    }
+    await this.store.save();
+    return { queued: selected.length, remaining: Math.max(0, candidates.length - selected.length) };
+  }
+
+  async retryOrFail(task, message, countedAttempt, { fallbackFailure = false, forceFallback = false, permanent = false, retryAfterMs = 0 } = {}) {
     if (!countedAttempt) task.attempts += 1;
     const wasFallback = task.resolved?.resolveMode === "browser_sniff" || fallbackFailure;
     task.gid = null;
@@ -971,6 +1362,7 @@ export class Scheduler {
     task.updatedAt = nowIso();
     const ordinaryAttemptsExhausted = task.attempts >= this.config.maxAttempts;
     const canUseFallback = this.config.browserFallbackEnabled !== false && !task.browserFallbackAttempted;
+    const delay = Math.max(Number(this.config.retryDelayMs) || 0, Math.min(60_000, Math.max(0, Number(retryAfterMs) || 0)));
     if (permanent) {
       task.state = "failed";
       task.browserFallbackPending = false;
@@ -979,17 +1371,19 @@ export class Scheduler {
     } else if (!wasFallback && (ordinaryAttemptsExhausted || forceFallback) && canUseFallback) {
       task.state = "queued";
       task.browserFallbackPending = true;
-      task.nextRunAt = this.clock.now() + this.config.retryDelayMs;
+      task.nextRunAt = this.clock.now() + delay;
       task.message = `${message}；普通 CDN 已全部尝试，下一步使用网页播放嗅探兜底`;
     } else if (wasFallback || ordinaryAttemptsExhausted || forceFallback) {
       task.state = "failed";
       task.browserFallbackPending = false;
       task.message = wasFallback
         ? `${message}；网页播放嗅探兜底也未能完成下载`
-        : `${message}；已达到 ${this.config.maxAttempts} 次上限`;
+        : ordinaryAttemptsExhausted
+          ? `${message}；已达到 ${this.config.maxAttempts} 次上限`
+          : `${message}；无可用媒体源，且网页嗅探兜底已使用或未开启`;
     } else {
       task.state = "queued";
-      task.nextRunAt = this.clock.now() + this.config.retryDelayMs;
+      task.nextRunAt = this.clock.now() + delay;
       task.message = `${message}；稍后重新解析`;
     }
     await this.store.save();
@@ -1017,6 +1411,9 @@ export class Scheduler {
       }
       for (const task of this.store.state.tasks.filter(item => item.state === "downloading")) {
         await this.reconcileDownloadTask(task);
+      }
+      for (const task of this.store.state.tasks.filter(item => item.state === "finalizing" && Number(item.spaceRetryAt || 0) <= this.clock.now())) {
+        await this.complete(task);
       }
     } finally {
       this.busy = false;
@@ -1084,8 +1481,24 @@ export class Scheduler {
     if (task.downloadEngine === "ffmpeg") await this.ffmpeg?.forget(task.id, { kill: true });
     else if (task.gid) await this.aria2.forget(task.gid);
     await this.cleanupTaskStaging(task);
-    const category = classifyError(message);
+    message = safeFailureMessage(message);
+    const policy = failurePolicy(message, null, "cdn");
+    if (policy.category === "rate_limited") {
+      // aria2's RPC error omits HTTP headers. A bounded HEAD reads only the
+      // retry hint; if unavailable, wait conservatively instead of hammering.
+      policy.retryAfterMs = 60_000;
+      if (task.resolved?.url) {
+        try {
+          const response = await this.httpRequest(task.resolved.url, { method: "HEAD", headers: task.resolved.headers || {}, signal: AbortSignal.timeout(2000) });
+          const value = response.headers.get("retry-after");
+          if (value) policy.retryAfterMs = retryAfterDelay(value, this.clock.now());
+          await response.body?.cancel();
+        } catch { /* The next fresh resolution will retry with a bounded delay. */ }
+      }
+    }
+    const { category } = policy;
     task.lastErrorCategory = category;
+    task.lastFailure = policy;
     this.store.recordAttempt?.(task, {
       phase: "download",
       outcome: "failure",
@@ -1094,21 +1507,91 @@ export class Scheduler {
       sourceHost: task.sourceHost || "",
       completedLength: task.completedLength || 0
     });
-    await this.retryOrFail(task, message, true, { permanent: isPermanentErrorCategory(category) });
+    await this.retryOrFail(task, message, true, { retryAfterMs: policy.retryAfterMs });
+  }
+
+  async hasDownloadSpace(root, incomingBytes) {
+    const minimumFreeBytes = Math.max(0, Number(this.config.downloadMinimumFreeBytes) || 0);
+    if (minimumFreeBytes === 0) return true;
+    try {
+      await mkdir(root, { recursive: true });
+      const result = await this.diskSpaceProvider(root);
+      const availableBytes = typeof result === "number"
+        ? result
+        : Number(result?.bavail) * Number(result?.bsize);
+      const stagingRoot = this.config.stagingRoot || this.config.dataRoot || "";
+      const sameVolumeAsStaging = stagingRoot
+        && this.volumeKeyProvider(stagingRoot) === this.volumeKeyProvider(root);
+      const additionalBytes = sameVolumeAsStaging ? 0 : Math.max(0, Number(incomingBytes) || 0);
+      return Number.isFinite(availableBytes) && availableBytes - additionalBytes >= minimumFreeBytes;
+    } catch {
+      // Fail closed when free space cannot be verified: finalization retries
+      // later and keeps the completed download in staging rather than filling a disk.
+      return false;
+    }
+  }
+
+  destinationRootFor(filePath) {
+    const roots = [this.config.downloadRoot, this.config.fallbackDownloadRoot]
+      .filter(value => typeof value === "string" && value.trim())
+      .map(value => path.resolve(value));
+    return roots.find(root => {
+      const relative = path.relative(root, path.resolve(filePath));
+      return relative && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+    }) || "";
+  }
+
+  async chooseDownloadDestination(task, incomingBytes, preferredPath = "") {
+    const primaryRoot = path.resolve(this.config.downloadRoot);
+    const fallbackRoot = String(this.config.fallbackDownloadRoot || "").trim()
+      ? path.resolve(this.config.fallbackDownloadRoot)
+      : "";
+    const roots = [...new Set([primaryRoot, fallbackRoot].filter(Boolean))];
+    const preferredRoot = preferredPath ? this.destinationRootFor(preferredPath) : "";
+    const orderedRoots = preferredRoot
+      ? [preferredRoot, ...roots.filter(root => root !== preferredRoot)]
+      : roots;
+    const categoryFolder = task.categoryFolder || this.store.authorCategory?.(task.author) || "";
+    task.categoryFolder = categoryFolder;
+    for (const root of orderedRoots) {
+      if (!await this.hasDownloadSpace(root, incomingBytes)) continue;
+      const requestedDestination = preferredRoot === root
+        ? preferredPath
+        : categoryFolder
+          ? path.join(root, categoryFolder, task.resolved.relativePath)
+          : path.join(root, task.resolved.relativePath);
+      return await availableDestination(requestedDestination);
+    }
+    return "";
   }
 
   async complete(task) {
     let destination = task.pendingDestination;
-    if (!destination) {
-      const categoryFolder = this.store.authorCategory?.(task.author) || "";
-      const requestedDestination = categoryFolder
-        ? path.join(this.config.downloadRoot, categoryFolder, task.resolved.relativePath)
-        : path.join(this.config.downloadRoot, task.resolved.relativePath);
-      destination = await availableDestination(requestedDestination);
-      task.pendingDestination = destination;
-      task.categoryFolder = categoryFolder;
+    const stagingInfo = task.stagingFile ? await fileInfo(task.stagingFile) : null;
+    const incomingBytes = stagingInfo?.size ?? Number(task.totalLength || 0);
+    const existingDestination = destination ? await fileInfo(destination) : null;
+    const selectedDestination = existingDestination
+      ? destination
+      : await this.chooseDownloadDestination(task, incomingBytes, destination || "");
+    if (!selectedDestination) {
+      const reserveGiB = (Math.max(0, Number(this.config.downloadMinimumFreeBytes) || 0) / (1024 ** 3)).toFixed(0);
       task.state = "finalizing";
-      task.message = "正在完成文件入库";
+      task.message = `J 盘和 F 盘均无法在保留 ${reserveGiB} GiB 空间后容纳此文件；文件仍保留在暂存区，稍后自动重试`;
+      task.spaceRetryAt = this.clock.now() + Math.max(30_000, Number(this.config.downloadSpaceRetryMs) || 60_000);
+      task.updatedAt = nowIso();
+      await this.store.save();
+      return false;
+    }
+    if (!destination || path.resolve(selectedDestination) !== path.resolve(destination)) {
+      destination = selectedDestination;
+      task.pendingDestination = destination;
+      task.state = "finalizing";
+      const destinationRoot = this.destinationRootFor(destination);
+      const usingFallback = destinationRoot && destinationRoot !== path.resolve(this.config.downloadRoot);
+      const reserveGiB = (Math.max(0, Number(this.config.downloadMinimumFreeBytes) || 0) / (1024 ** 3)).toFixed(0);
+      task.message = usingFallback
+        ? `J 盘将低于 ${reserveGiB} GiB 预留空间，已改存 F 盘 Video 目录`
+        : "正在完成文件入库（J 盘保留空间充足）";
       await this.store.save();
     }
     const destinationInfo = await fileInfo(destination);
@@ -1120,6 +1603,7 @@ export class Scheduler {
     else if (task.gid) await this.aria2.forget(task.gid);
     await this.cleanupTaskStaging(task);
     task.state = "completed";
+    task.spaceRetryAt = 0;
     task.destination = destination;
     const finalInfo = await fileInfo(destination);
     task.actualFileSize = finalInfo ? String(finalInfo.size) : "0";
@@ -1132,7 +1616,10 @@ export class Scheduler {
     task.resolved = null;
     task.completedAt = nowIso();
     task.updatedAt = nowIso();
-    task.message = "下载完成";
+    task.message = this.destinationRootFor(destination) && this.destinationRootFor(destination) !== path.resolve(this.config.downloadRoot)
+      ? "下载完成，已保存到 F 盘 Video 目录"
+      : "下载完成";
+    queueMissingIwaraMetadata(task);
     this.store.recordAttempt?.(task, {
       phase: "download",
       outcome: "success",
@@ -1140,6 +1627,14 @@ export class Scheduler {
       completedLength: task.completedLength || task.totalLength || 0
     });
     await this.store.save();
+    await this.notifyCompleted(task);
+  }
+
+  async notifyCompleted(task) {
+    // Hashing is queued only after the completed ledger row was committed.
+    // The callback must enqueue work, not wait for a full-file hash.
+    try { await this.onCompleted?.(task); }
+    catch (error) { console.warn(`[fingerprint] ${task.id}: ${safeFailureMessage(error.message)}`); }
   }
 
   async recoverFinalizing(task) {
@@ -1158,7 +1653,10 @@ export class Scheduler {
       task.updatedAt = nowIso();
       task.gid = null;
       task.resolved = null;
+      queueMissingIwaraMetadata(task);
       await this.cleanupTaskStaging(task);
+      await this.store.save();
+      await this.notifyCompleted(task);
       return;
     }
     if (task.stagingFile && await fileInfo(task.stagingFile) && task.resolved) {
@@ -1174,6 +1672,7 @@ export class Scheduler {
   }
 
   async verifyCompletedTask(task) {
+    if (task.identityStatus === "changed") { task.fileStatus = "identity_changed"; return; }
     task.mediaCheckedAt = nowIso();
     if (!task.destination) {
       task.fileStatus = "unknown";
@@ -1215,8 +1714,15 @@ export class Scheduler {
   async retryTask(taskId) {
     const task = this.store.state.tasks.find(item => item.id === taskId);
     if (!task || task.state !== "failed") throw new Error("只能重试失败任务");
+    const filterMatch = this.downloadFilterMatch(task);
+    if (filterMatch) {
+      const filtered = this.markTaskFiltered(task, filterMatch);
+      await this.store.save();
+      return filtered;
+    }
     task.state = "queued";
     task.attempts = 0;
+    task.sourceFailureCursor = this.store.sourceFailureCursor?.(task.id) || 0;
     task.browserFallbackPending = false;
     task.browserFallbackAttempted = false;
     task.nextRunAt = 0;
@@ -1229,6 +1735,8 @@ export class Scheduler {
   async redownloadTask(taskId) {
     const task = this.store.state.tasks.find(item => item.id === taskId);
     if (!task || task.state !== "completed") throw new Error("只能重新下载已完成记录");
+    const filterMatch = this.downloadFilterMatch(task);
+    if (filterMatch) throw new Error(`${downloadFilterMessage(filterMatch)}，不能重新下载`);
     await this.verifyCompletedTask(task);
     if (task.fileStatus === "present") throw new Error("文件仍然存在，无需重新下载");
     if (["too_small", "not_media", "size_mismatch"].includes(task.fileStatus) && task.destination) {
@@ -1242,6 +1750,7 @@ export class Scheduler {
     }
     task.state = "queued";
     task.attempts = 0;
+    task.sourceFailureCursor = this.store.sourceFailureCursor?.(task.id) || 0;
     task.browserFallbackPending = false;
     task.browserFallbackAttempted = false;
     task.nextRunAt = 0;
@@ -1256,6 +1765,7 @@ export class Scheduler {
 
   async verifyFiles() {
     let present = 0, missing = 0, sizeMismatch = 0;
+    await this.store.fileIdentity?.scan();
     // A manual verification is also the explicit signal that files may have
     // been moved or renamed since the last scan.
     this.mediaIndex = null;
@@ -1266,7 +1776,7 @@ export class Scheduler {
       else if (task.fileStatus === "size_mismatch") sizeMismatch += 1;
     }
     await this.store.save();
-    return { present, missing, sizeMismatch };
+    return { present, missing, sizeMismatch, fileIdentity: this.store.fileIdentity?.status() || null };
   }
 
   async openDownloadDirectory() {
@@ -1461,14 +1971,26 @@ export class Scheduler {
     };
     return {
       counts: this.store.counts?.() || Object.fromEntries(
-        ["queued", "resolving", "downloading", "finalizing", "completed", "failed"]
+        ["queued", "resolving", "downloading", "finalizing", "completed", "failed", "filtered"]
           .map(state => [state, tasks.filter(task => task.state === state).length])
       ),
+      downloadFilter: {
+        blockedTags: Array.isArray(this.config.downloadFilter?.blockedTags) ? this.config.downloadFilter.blockedTags.length : 0,
+        han1meIds: Array.isArray(this.config.downloadFilter?.han1meIds) ? this.config.downloadFilter.han1meIds.length : 0,
+        pixivIds: Array.isArray(this.config.downloadFilter?.pixivIds) ? this.config.downloadFilter.pixivIds.length : 0,
+        iwaraVideoIds: Array.isArray(this.config.downloadFilter?.iwaraVideoIds) ? this.config.downloadFilter.iwaraVideoIds.length : 0
+      },
       current: tasks.find(task => ["resolving", "downloading", "finalizing"].includes(task.state)) || null,
       currents: tasks.filter(task => ["resolving", "downloading", "finalizing"].includes(task.state)),
       metadataCounts,
       viewCounts,
       tagCounts,
+      authorBackfill: Object.fromEntries(
+        ["pending", "retry", "enriching", "complete", "failed", "paused", "folder"]
+          .map(state => [state, tasks.filter(task => task.authorBackfillStatus === state).length])
+      ),
+      backup: this.store.backupManager?.status() || null,
+      fileIdentity: this.store.fileIdentity?.status() || null,
       metadataCurrent: tasks.find(task => task.metadataStatus === "enriching") || null,
       metadataCurrents: tasks.filter(task => task.metadataStatus === "enriching"),
       activeTaskCount: this.activeTaskCount(),
@@ -1492,9 +2014,11 @@ export class Scheduler {
 
   playlistTags(options = {}) {
     if (this.store.playlistTags) return this.store.playlistTags(options);
+    const source = normalizeMediaSource(options.source);
     const counts = new Map();
     for (const task of this.store.state.tasks || []) {
-      if (task.state !== "completed" || !task.destination) continue;
+      if (task.state !== "completed" || !task.destination || task.discarded) continue;
+      if (source !== "all" && classifyMediaSource(task) !== source) continue;
       const seen = new Set();
       for (const tag of normalizeTags(task.tags)) {
         if (seen.has(tag)) continue;
@@ -1507,17 +2031,36 @@ export class Scheduler {
       .map(([tag, count]) => ({ tag, count }));
   }
 
-  async updatePlaylistFlags(taskId, { favorite, watchLater, queued } = {}) {
+  playlistAuthors({ source = "all" } = {}) {
+    const normalized = normalizeMediaSource(source);
+    if (this.store.playlistAuthors) return this.store.playlistAuthors(normalized);
+    if (this.store.authors) return this.store.authors(normalized);
+    const counts = new Map();
+    for (const task of this.store.state.tasks || []) {
+      if (!task.author || (normalized !== "all" && classifyMediaSource(task) !== normalized)) continue;
+      const entry = counts.get(task.author) || { author: task.author, alias: "", count: 0 };
+      entry.alias = task.alias || entry.alias;
+      entry.count += 1;
+      counts.set(task.author, entry);
+    }
+    return [...counts.values()].sort((a, b) => a.author.localeCompare(b.author, "zh-CN"));
+  }
+
+  async updatePlaylistFlags(taskId, { favorite, watchLater, queued, discarded } = {}) {
     const task = this.store.state.tasks.find(item => item.id === taskId);
     if (!task || task.state !== "completed") throw new Error("只能操作已完成视频");
     if (typeof favorite === "boolean") task.favorite = favorite;
     if (typeof watchLater === "boolean") task.watchLater = watchLater;
+    if (typeof discarded === "boolean") {
+      task.discarded = discarded;
+    }
     if (typeof queued === "boolean") {
       if (queued) {
         const max = this.store.state.tasks.reduce((value, item) => Math.max(value, Number(item.queuePosition) || 0), 0);
         task.queuePosition = max + 1;
       } else task.queuePosition = null;
     }
+    if (task.discarded) task.queuePosition = null;
     await this.store.save();
     return publicTask(task);
   }
@@ -1529,6 +2072,7 @@ export class Scheduler {
     for (const task of selected) {
       task.state = "queued";
       task.attempts = 0;
+      task.sourceFailureCursor = this.store.sourceFailureCursor?.(task.id) || 0;
       task.browserFallbackPending = false;
       task.browserFallbackAttempted = false;
       task.nextRunAt = 0;
@@ -1541,10 +2085,10 @@ export class Scheduler {
     return { queued: selected.length, category: normalized || "all" };
   }
 
-  async playlist({ query = "", author = "all", watched = "all", favorite = "all", watchLater = "all", queue = "all", taskId = "", contextId = "", contextIndex = null, contextSize = 5, sort = "updatedAt", direction = "desc", page = 1, pageSize = 25, randomPage = false } = {}) {
+  async playlist({ query = "", author = "all", watched = "all", favorite = "all", watchLater = "all", queue = "all", discarded = "exclude", taskId = "", contextId = "", contextIndex = null, contextSize = 5, sort = "updatedAt", direction = "desc", page = 1, pageSize = 25, randomPage = false, randomSample = false, randomSeed = "", source = "all" } = {}) {
     if (this.store.queryPlaylist) {
       const result = this.store.queryPlaylist({
-        query, author, watched, favorite, watchLater, queue, sort, direction, page, pageSize, randomPage, contextId, contextIndex, contextSize
+        query, author, watched, favorite, watchLater, queue, discarded, sort, direction, page, pageSize, randomPage, randomSample, randomSeed, contextId, contextIndex, contextSize, source
       });
       let playerError = null;
       if (contextId && !result.currentIndex && result.currentIndex !== 0) {
@@ -1554,6 +2098,10 @@ export class Scheduler {
         else if (contextTask.fileStatus !== "present") playerError = {
           code: "missing_file",
           message: `台账记录存在，但本地文件状态为“${contextTask.fileStatus || "未检查"}”；请先检查文件或重新下载。`
+        };
+        else if (contextTask.discarded && discarded !== "only" && discarded !== "all") playerError = {
+          code: "discarded",
+          message: "这个视频已被丢弃并从普通列表隐藏；可在“已丢弃”筛选中恢复。"
         };
         else playerError = {
           code: "media_unavailable",
@@ -1575,15 +2123,17 @@ export class Scheduler {
         globalIndex: result.globalIndex ?? null,
         hasPrevious: Boolean(result.hasPrevious),
         hasNext: Boolean(result.hasNext),
-        authors: this.store.authors?.() || [],
+        authors: this.playlistAuthors({ source }),
         items,
         playerError
       };
     }
     const needle = String(query || "").trim().toLocaleLowerCase();
+    const normalizedSource = normalizeMediaSource(source);
     const matches = [];
     for (const task of this.store.state.tasks) {
       if (task.state !== "completed" || !task.destination) continue;
+      if (normalizedSource !== "all" && classifyMediaSource(task) !== normalizedSource) continue;
       // A standalone player asks for a small neighborhood around one item.
       // Keep the normal taskId filter for the legacy one-item view, but do
       // not throw away neighbors when contextId is present.
@@ -1593,6 +2143,8 @@ export class Scheduler {
       if (favorite === "not_favorite" && task.favorite) continue;
       if (watchLater === "later" && !task.watchLater) continue;
       if (watchLater === "not_later" && task.watchLater) continue;
+      if (discarded === "only" && !task.discarded) continue;
+      if (discarded !== "only" && discarded !== "all" && task.discarded) continue;
       if (queue === "queued" && !Number.isSafeInteger(Number(task.queuePosition))) continue;
       if (queue === "not_queued" && Number.isSafeInteger(Number(task.queuePosition))) continue;
       if (!needle) {
@@ -1628,10 +2180,12 @@ export class Scheduler {
     });
     const safePageSize = Math.min(60, Math.max(6, Number(pageSize) || 25));
     const pageCount = Math.max(1, Math.ceil(matches.length / safePageSize));
-    const safePage = randomPage
+    const safePage = randomSample ? 1 : randomPage
       ? 1 + Math.floor(Math.random() * pageCount)
       : Math.min(pageCount, Math.max(1, Number(page) || 1));
-    let selected = matches.slice((safePage - 1) * safePageSize, safePage * safePageSize);
+    let selected = randomSample
+      ? shuffleWithSeed(matches, randomSeed || randomUUID()).slice(0, safePageSize)
+      : matches.slice((safePage - 1) * safePageSize, safePage * safePageSize);
     let currentIndex = null;
     let globalIndex = null;
     let hasPrevious = false;
@@ -1662,7 +2216,7 @@ export class Scheduler {
         viewsUpdatedAt: task.viewsUpdatedAt || null,
         localFileName: path.basename(task.destination)
       }));
-    return { total: matches.length, page: safePage, pageSize: safePageSize, currentIndex, globalIndex, hasPrevious, hasNext, authors: this.store.authors?.() || [], items };
+    return { total: matches.length, page: safePage, pageSize: safePageSize, currentIndex, globalIndex, hasPrevious, hasNext, authors: this.playlistAuthors({ source }), items };
   }
 
   async updatePlayback(taskId, payload = {}) {
@@ -1688,18 +2242,20 @@ export class Scheduler {
 
   mediaCandidates(task) {
     const root = path.resolve(this.config.downloadRoot);
+    const allowedRoots = [root, ...(Array.isArray(this.config.externalMediaRoots) ? this.config.externalMediaRoots : [])]
+      .map(item => path.resolve(item));
     const original = path.resolve(task.destination);
     const candidates = [];
     const add = candidate => {
       const resolved = path.resolve(candidate);
-      const relative = path.relative(root, resolved);
-      if (resolved === root || !relative || relative.startsWith("..") || path.isAbsolute(relative)) return;
+      const allowed = allowedRoots.some(allowedRoot => {
+        const relative = path.relative(allowedRoot, resolved);
+        return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative);
+      });
+      if (!allowed) return;
       if (!candidates.includes(resolved)) candidates.push(resolved);
     };
-    const originalRelative = path.relative(root, original);
-    if (originalRelative && !originalRelative.startsWith("..") && !path.isAbsolute(originalRelative)) {
-      add(original);
-    }
+    add(original);
     // Preserve the subdirectory below a previous ...\\Video root when the
     // complete folder was moved to the currently configured download root.
     const rootName = path.basename(root).toLocaleLowerCase();
@@ -1727,9 +2283,11 @@ export class Scheduler {
   }
 
   async buildMediaIndex() {
-    const root = path.resolve(this.config.downloadRoot);
     const index = new Map();
-    const pending = [root];
+    const roots = [...new Set([this.config.downloadRoot, this.config.fallbackDownloadRoot]
+      .filter(value => typeof value === "string" && value.trim())
+      .map(value => path.resolve(value)))];
+    const pending = [...roots];
     while (pending.length) {
       const directory = pending.pop();
       let entries;
@@ -1766,6 +2324,9 @@ export class Scheduler {
   }
 
   async locateMediaFile(task) {
+    if (task.identityStatus === "changed") return null;
+    const fingerprintMatch = await this.store.fileIdentity?.locate(task);
+    if (fingerprintMatch) return fingerprintMatch;
     const candidates = this.mediaCandidates(task);
     const indexedPath = (await this.ensureMediaIndex()).get(String(task.videoId || ""));
     if (indexedPath && !candidates.includes(indexedPath)) candidates.push(indexedPath);
@@ -1778,6 +2339,7 @@ export class Scheduler {
 
   async mediaPath(taskId) {
     const task = this.store.state.tasks.find(item => item.id === taskId);
+    if (task?.identityStatus === "changed") throw new Error("本地文件内容已改变，未自动关联旧观看记录");
     if (!task || task.state !== "completed" || !task.destination) throw new Error("本地视频不存在");
     const media = await this.locateMediaFile(task);
     if (media) return { path: media.path, name: path.basename(media.path) };
