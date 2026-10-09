@@ -1,8 +1,28 @@
 $ErrorActionPreference = "Stop"
 $appRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $launcherErrorLog = Join-Path $appRoot "launcher-error.log"
+function Get-SafeLauncherFailureMessage {
+    param([string]$Message)
+
+    $position = [regex]::Match($Message, '\((\d+)\):\s*\{')
+    if ($Message -match '(?i)config(?:uration)?|配置文件' -and $position.Success) {
+        return "配置文件 JSON 格式错误，约在第 $($position.Groups[1].Value) 个字符。为保护密钥，配置正文已隐藏；请检查 config.json 格式。"
+    }
+
+    # Some PowerShell JSON parser errors append the complete input document.
+    # Never show or persist a structured object from an exception.
+    $jsonStart = [regex]::Match($Message, '(?s)\{\s*"(?:dataRoot|downloadRoot|aria2Secret|lanAccessToken|servicePort)"\s*:')
+    if ($jsonStart.Success) {
+        $Message = $Message.Substring(0, $jsonStart.Index) + "[结构化配置内容已隐藏]"
+    }
+    return [regex]::Replace(
+        $Message,
+        '(?i)("?(?:aria2Secret|lanAccessToken|access_token|token)"?\s*[:=]\s*)("[^"]*"|[^,\s}]+)',
+        '$1[已隐藏]'
+    )
+}
 trap {
-    $failureMessage = [string]$_.Exception.Message
+    $failureMessage = Get-SafeLauncherFailureMessage -Message ([string]$_.Exception.Message)
     try { Add-Content -LiteralPath $launcherErrorLog -Value "[$(Get-Date -Format s)] $failureMessage" -Encoding UTF8 } catch {}
     try {
         Add-Type -AssemblyName System.Windows.Forms
@@ -23,7 +43,7 @@ if (Test-Path -LiteralPath $configPath) {
         $localConfig = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
         if ($localConfig.dataRoot -and -not $env:IWARA_DATA_ROOT) { $dataRoot = [string]$localConfig.dataRoot }
     } catch {
-        throw "Unable to read config file ${configPath}: $($_.Exception.Message)"
+        throw (Get-SafeLauncherFailureMessage -Message "Unable to read config file ${configPath}: $($_.Exception.Message)")
     }
 }
 if (-not $dataRoot -and (Test-Path -LiteralPath $examplePath)) {
@@ -31,7 +51,7 @@ if (-not $dataRoot -and (Test-Path -LiteralPath $examplePath)) {
         $exampleConfig = Get-Content -LiteralPath $examplePath -Raw | ConvertFrom-Json
         $dataRoot = [string]$exampleConfig.dataRoot
     } catch {
-        throw "Unable to read example config ${examplePath}: $($_.Exception.Message)"
+        throw (Get-SafeLauncherFailureMessage -Message "Unable to read example config ${examplePath}: $($_.Exception.Message)")
     }
 }
 if (-not $dataRoot) { $dataRoot = Join-Path $appRoot "data" }
@@ -44,7 +64,7 @@ if (-not $env:IWARA_CONFIG_PATH -and -not (Test-Path -LiteralPath $configPath)) 
                 $legacyConfig = Get-Content -LiteralPath $legacyConfigPath -Raw | ConvertFrom-Json
                 if ($legacyConfig.dataRoot) { $dataRoot = [string]$legacyConfig.dataRoot }
             } catch {
-                throw "Unable to read legacy config file ${legacyConfigPath}: $($_.Exception.Message)"
+                throw (Get-SafeLauncherFailureMessage -Message "Unable to read legacy config file ${legacyConfigPath}: $($_.Exception.Message)")
             }
         }
     }
