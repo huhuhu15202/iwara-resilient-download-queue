@@ -62,6 +62,7 @@ public final class MainActivity extends Activity {
     private boolean showHidden, busy, randomOrder, destroyed; private final ArrayList<LibraryDb.Video> pendingMediaDelete=new ArrayList<>();
     private ArrayList<String> restoredBatch;
     private Uri pendingAuthorizationTree;
+    private Uri pendingScanAuthorizationTree;
     private int columns = 2;
     private GestureDetector navigationGesture;
     private boolean navigationSwipeStartedInGrid;
@@ -78,7 +79,7 @@ public final class MainActivity extends Activity {
         authorScope = getIntent().getStringExtra("author_scope");
         if (authorScope == null) authorScope = "";
         if (!authorScope.isEmpty()) author = authorScope;
-        if (saved != null) { author = saved.getString("author", ""); tag = saved.getString("tag", ""); sort = saved.getString("sort", "最近下载"); query = saved.getString("query", ""); sourceFilter=saved.getString("source_filter","all"); showHidden = saved.getBoolean("hidden");randomOrder=saved.getBoolean("random");restoredBatch=saved.getStringArrayList("batch");String pending=saved.getString("authorization_tree","");if(!pending.isEmpty())pendingAuthorizationTree=Uri.parse(pending); }
+        if (saved != null) { author = saved.getString("author", ""); tag = saved.getString("tag", ""); sort = saved.getString("sort", "最近下载"); query = saved.getString("query", ""); sourceFilter=saved.getString("source_filter","all"); showHidden = saved.getBoolean("hidden");randomOrder=saved.getBoolean("random");restoredBatch=saved.getStringArrayList("batch");String pending=saved.getString("authorization_tree","");if(!pending.isEmpty())pendingAuthorizationTree=Uri.parse(pending);String pendingScan=saved.getString("scan_authorization_tree","");if(!pendingScan.isEmpty())pendingScanAuthorizationTree=Uri.parse(pendingScan); }
         else sourceFilter=getPreferences(MODE_PRIVATE).getString("source_filter","all");
         if(!Arrays.asList("all","iwara","han1").contains(sourceFilter))sourceFilter="all";
         int availableWidthDp = getResources().getConfiguration().screenWidthDp;
@@ -180,7 +181,7 @@ public final class MainActivity extends Activity {
     }
 
     private final Runnable searchRefresh = () -> { query = search.getText().toString().trim(); randomOrder = false; refresh(false); };
-    @Override protected void onSaveInstanceState(Bundle out) { super.onSaveInstanceState(out); out.putString("author",author); out.putString("tag",tag); out.putString("sort",sort); out.putString("query",query);out.putString("source_filter",sourceFilter); out.putBoolean("hidden",showHidden); out.putInt("position",grid.getFirstVisiblePosition());out.putBoolean("random",randomOrder);if(pendingAuthorizationTree!=null)out.putString("authorization_tree",pendingAuthorizationTree.toString());if(randomOrder){ArrayList<String> batch=new ArrayList<>();for(LibraryDb.Video video:items)batch.add(video.uri);out.putStringArrayList("batch",batch);} }
+    @Override protected void onSaveInstanceState(Bundle out) { super.onSaveInstanceState(out); out.putString("author",author); out.putString("tag",tag); out.putString("sort",sort); out.putString("query",query);out.putString("source_filter",sourceFilter); out.putBoolean("hidden",showHidden); out.putInt("position",grid.getFirstVisiblePosition());out.putBoolean("random",randomOrder);if(pendingAuthorizationTree!=null)out.putString("authorization_tree",pendingAuthorizationTree.toString());if(pendingScanAuthorizationTree!=null)out.putString("scan_authorization_tree",pendingScanAuthorizationTree.toString());if(randomOrder){ArrayList<String> batch=new ArrayList<>();for(LibraryDb.Video video:items)batch.add(video.uri);out.putStringArrayList("batch",batch);} }
     @Override protected void onDestroy() { destroyed = true; cancelled.set(true); ui.removeCallbacksAndMessages(null); work.shutdownNow(); covers.shutdownNow(); images.evictAll(); new Thread(() -> {try{while(!work.awaitTermination(10,TimeUnit.SECONDS)){}db.close();}catch(InterruptedException ignored){}} ,"close-library").start(); super.onDestroy(); }
     private int dp(float value) { return Math.round(value * getResources().getDisplayMetrics().density); }
     private void selectSource(String key){if(sourceFilter.equals(key))return;sourceFilter=key;getPreferences(MODE_PRIVATE).edit().putString("source_filter",sourceFilter).apply();randomOrder=false;updateSourceButtons();refresh(false);}
@@ -277,9 +278,10 @@ public final class MainActivity extends Activity {
         managementAction(options,"link","电脑服务连接",connection.origin(),()->{dialog.dismiss();connectionDialog();});
         managementAction(options,"sync","同步电脑资料","更新台账、作者和标签资料",()->{dialog.dismiss();sync();});
         managementAction(options,"download","随机下载到手机","按当前来源 · 默认 20 个 · 自动分批解包",()->{dialog.dismiss();randomDownloadDialog();});
-        String directoryLabel=getPreferences(MODE_PRIVATE).getString("directory_name","已授权的视频目录");
-        String scope=getPreferences(MODE_PRIVATE).getString("directory","").isEmpty()?("media".equals(getPreferences(MODE_PRIVATE).getString("scan_scope","tree"))?"当前：系统视频媒体库":"尚未选择目录，点击授权"):"当前："+directoryLabel+"（含子文件夹）";
-        managementAction(options,"folder","扫描文件夹",scope,()->{dialog.dismiss();new AlertDialog.Builder(this).setTitle("扫描文件夹").setItems(new String[]{"选择 / 更换视频文件夹","可选：使用系统视频媒体库"},(selection,which)->{if(which==0)chooseDirectory();else{getPreferences(MODE_PRIVATE).edit().remove("directory").remove("directory_name").putString("scan_scope","media").apply();scan();}}).setNegativeButton("取消",null).show();});
+        List<LibraryDb.ScanRoot> roots=configuredScanRoots();
+        String scope=roots.isEmpty()?("media".equals(getPreferences(MODE_PRIVATE).getString("scan_scope","tree"))?"系统视频媒体库":"尚未添加扫描目录"):roots.size()+" 个扫描目录（含子文件夹）";
+        managementAction(options,"folder","扫描位置",scope,()->{dialog.dismiss();scanDirectoryManager();});
+        managementAction(options,"download","接收 / 下载目录",receiveDirectoryLabel(),()->{dialog.dismiss();chooseReceiveDirectory();});
         managementAction(options,"folder","文件访问权限",storagePermissionLabel(),()->{dialog.dismiss();storagePermissions();});
         managementAction(options,"library","重新扫描视频","检查当前范围，新文件和改名都会重新识别",()->{dialog.dismiss();scan();});
         managementAction(options,"manage","清理重复文件","完整指纹核验，选择保留项后清理手机副本",()->{dialog.dismiss();findDuplicates();});
@@ -296,7 +298,33 @@ public final class MainActivity extends Activity {
         String lanLabel=origins[0].isEmpty()?"未配置":origins[0];String remoteLabel=origins[1].isEmpty()?"未配置":origins[1];
         AlertDialog dialog=new AlertDialog.Builder(this).setTitle("同步连接").setSingleChoiceItems(new String[]{"局域网 · "+lanLabel,"远程 Tailscale · "+remoteLabel},chosen,(selection,which)->{}).setPositiveButton("使用此连接",(selection,which)->{int selected=((AlertDialog)selection).getListView().getCheckedItemPosition();if(origins[selected].isEmpty()){toast("此地址未配置；请在本机 config.json 中填写个人连接地址后重新构建");return;}try{connection.save(origins[selected],connection.token());toast("同步连接已切换");}catch(Exception error){toast("连接设置失败："+safeError(error));}}).setNegativeButton("取消",null).create();dialog.show();roundDialog(dialog);
     }
-    private Uri selectedDirectory(){String value=getPreferences(MODE_PRIVATE).getString("directory","");return value.isEmpty()?null:Uri.parse(value);}
+    private Uri selectedDirectory(){String value=getPreferences(MODE_PRIVATE).getString("receive_directory","");if(value.isEmpty())value=getPreferences(MODE_PRIVATE).getString("directory","");return value.isEmpty()?null:Uri.parse(value);}
+    private String receiveDirectoryLabel(){String value=getPreferences(MODE_PRIVATE).getString("receive_directory_name","");if(value.isEmpty())value=getPreferences(MODE_PRIVATE).getString("directory_name","已授权的视频目录");Uri tree=selectedDirectory();return tree==null?"尚未选择":value+" · "+StorageAccess.directory(this,tree).label();}
+    private List<LibraryDb.ScanRoot> configuredScanRoots(){
+        android.content.SharedPreferences preferences=getPreferences(MODE_PRIVATE);
+        if(!preferences.getBoolean("scan_roots_migrated",false)){
+            String legacy=preferences.getString("directory","");
+            if(!legacy.isEmpty()&&db.scanRoots().isEmpty())db.addScanRoot(legacy,preferences.getString("directory_name","旧视频目录"));
+            preferences.edit().putBoolean("scan_roots_migrated",true).apply();
+        }
+        return db.scanRoots();
+    }
+    private void scanDirectoryManager(){
+        List<LibraryDb.ScanRoot> roots=configuredScanRoots();
+        String[] labels=new String[roots.size()];for(int i=0;i<roots.size();i++)labels[i]=roots.get(i).label+" · 管理";
+        AlertDialog.Builder builder=new AlertDialog.Builder(this).setTitle("扫描位置 · "+roots.size()+" 个")
+            .setMessage(roots.isEmpty()?"添加一个或多个本机视频文件夹。扫描只需读取授权；授权失效时会保留原有资料，不会标记为丢失。":"点选目录可将它从扫描范围移除；移除不会删除手机文件或台账记录。多个目录会作为一轮完整扫描。")
+            .setItems(labels,(dialog,which)->new AlertDialog.Builder(this).setTitle(roots.get(which).label)
+                .setItems(new String[]{"重新授权读取", "从扫描范围移除"},(choice,action)->{
+                    if(action==0)chooseScanDirectoryForReauthorization(Uri.parse(roots.get(which).uri));
+                    else new AlertDialog.Builder(this).setTitle("移除此扫描位置？").setMessage("只从扫描范围移除；手机文件和已保存的资料记录都会保留。")
+                        .setNegativeButton("取消",null).setPositiveButton("移除",(confirm,w)->{db.removeScanRoot(roots.get(which).uri);scanDirectoryManager();}).show();
+                }).setNegativeButton("关闭",null).show())
+            .setPositiveButton("添加扫描目录",(dialog,which)->chooseScanDirectory()).setNegativeButton("关闭",null);
+        if(roots.isEmpty())builder.setNeutralButton("使用系统视频媒体库",(dialog,which)->{getPreferences(MODE_PRIVATE).edit().putString("scan_scope","media").apply();scan();});
+        else builder.setNeutralButton("立即扫描",(dialog,which)->scan());
+        AlertDialog dialog=builder.create();dialog.show();roundDialog(dialog);
+    }
     private String storagePermissionLabel(){Uri tree=selectedDirectory();return tree==null?("media".equals(getPreferences(MODE_PRIVATE).getString("scan_scope","tree"))?"系统视频媒体库 · 删除需系统确认":"尚未授权视频文件夹"):StorageAccess.directory(this,tree).label();}
     private void storagePermissions(){
         Uri tree=selectedDirectory();AlertDialog.Builder builder=new AlertDialog.Builder(this).setTitle("文件访问权限").setMessage(storagePermissionLabel()+"\n\n播放权限不等于删除权限。文件夹模式需要系统保存读写授权；只允许访问你选中的文件夹及子目录，不需要整个手机的所有文件权限。\nAndroid 11 及以上请选视频子文件夹，不要选 Download 根目录。授权后不会自动删除文件。")
@@ -305,7 +333,13 @@ public final class MainActivity extends Activity {
         else builder.setPositiveButton("重新授权此文件夹",(dialog,which)->chooseDirectoryForWrite(tree));
         AlertDialog dialog=builder.create();dialog.show();roundDialog(dialog);
     }
-    private void chooseDirectory(){try{startActivityForResult(StorageAccess.picker(selectedDirectory()),11);}catch(Exception error){toast("系统文件选择器无法打开："+safeError(error));}}
+    private void chooseDirectory(){
+        if(configuredScanRoots().isEmpty()&&selectedDirectory()==null){try{startActivityForResult(StorageAccess.picker(null),11);}catch(Exception error){toast("系统文件选择器无法打开："+safeError(error));}}
+        else chooseScanDirectory();
+    }
+    private void chooseScanDirectory(){try{startActivityForResult(StorageAccess.picker(null),16);}catch(Exception error){toast("系统文件选择器无法打开："+safeError(error));}}
+    private void chooseScanDirectoryForReauthorization(Uri tree){pendingScanAuthorizationTree=StorageAccess.treeOf(tree);try{startActivityForResult(StorageAccess.picker(pendingScanAuthorizationTree),17);}catch(Exception error){pendingScanAuthorizationTree=null;toast("系统文件选择器无法打开："+safeError(error));}}
+    private void chooseReceiveDirectory(){try{startActivityForResult(StorageAccess.picker(selectedDirectory()),15);}catch(Exception error){toast("系统文件选择器无法打开："+safeError(error));}}
     private void chooseDirectoryForWrite(Uri tree){pendingAuthorizationTree=StorageAccess.treeOf(tree);try{startActivityForResult(StorageAccess.picker(pendingAuthorizationTree),14);}catch(Exception error){pendingAuthorizationTree=null;toast("系统文件选择器无法打开："+safeError(error));}}
     private void deletionBlocked(StorageAccess.Deletion access){
         ui.post(()->{if(destroyed)return;AlertDialog.Builder builder=new AlertDialog.Builder(this).setTitle("未删除文件").setMessage(access.reason+"\n\n读取视频不代表有权删除。重新授权后请再次检查重复文件并确认；本次没有自动删除。")
@@ -318,19 +352,21 @@ public final class MainActivity extends Activity {
     private void roundDialog(AlertDialog dialog){Window window=dialog.getWindow();window.setBackgroundDrawable(glassStyle(28));window.setGravity(Gravity.BOTTOM);window.setLayout(getResources().getDisplayMetrics().widthPixels-dp(24),-2);window.setDimAmount(.28f);}
     private void scan() {
         failedCovers.clear();
-        String directory=getPreferences(MODE_PRIVATE).getString("directory","");
-        if(!directory.isEmpty()&&!StorageAccess.directory(this,Uri.parse(directory)).read){deletionBlocked(new StorageAccess.Deletion(false,false,"扫描文件夹读取授权已失效，请重新授权",Uri.parse(directory)));return;}
-        if(directory.isEmpty()) {
-            if(!"media".equals(getPreferences(MODE_PRIVATE).getString("scan_scope","tree"))){chooseDirectory();return;}
+        List<LibraryDb.ScanRoot> roots=configuredScanRoots();
+        for(LibraryDb.ScanRoot root:roots)if(!StorageAccess.directory(this,Uri.parse(root.uri)).read){toast("扫描目录读取授权已失效："+root.label+"。原有资料保持不变，请重新授权或移除该扫描位置。");return;}
+        boolean mediaScan=roots.isEmpty()&&"media".equals(getPreferences(MODE_PRIVATE).getString("scan_scope","tree"));
+        if(roots.isEmpty()&&!mediaScan) {chooseDirectory();return;}
+        if(mediaScan) {
             String permission=Build.VERSION.SDK_INT>=33?Manifest.permission.READ_MEDIA_VIDEO:Manifest.permission.READ_EXTERNAL_STORAGE;
             boolean partial = Build.VERSION.SDK_INT>=34 && checkSelfPermission("android.permission.READ_MEDIA_VISUAL_USER_SELECTED")==PackageManager.PERMISSION_GRANTED;
             if(checkSelfPermission(permission)!=PackageManager.PERMISSION_GRANTED && !partial) { if(Build.VERSION.SDK_INT>=34)requestPermissions(new String[]{permission,"android.permission.READ_MEDIA_VISUAL_USER_SELECTED"},10);else requestPermissions(new String[]{permission},10);return; }
         }
         runTask(() -> {
             String noMediaStatus = "";
-            if (!directory.isEmpty()) {
+            Uri receive=selectedDirectory();
+            if (receive!=null&&StorageAccess.directory(this,receive).write) {
                 try {
-                    boolean created = StorageAccess.ensureNoMedia(getApplicationContext(), Uri.parse(directory));
+                    boolean created = StorageAccess.ensureNoMedia(getApplicationContext(), receive);
                     noMediaStatus = created ? ".nomedia 已创建，系统图库将忽略此目录及子文件夹"
                             : "已有 .nomedia，系统图库将忽略此目录及子文件夹";
                 } catch (Exception error) {
@@ -338,7 +374,7 @@ public final class MainActivity extends Activity {
                 }
             }
             final String markerStatus = noMediaStatus;
-            new VideoScanner(getApplicationContext(),db,cancelled).scan(directory.isEmpty()?null:Uri.parse(directory),(message,refresh) -> {
+            new VideoScanner(getApplicationContext(),db,cancelled).scanRoots(roots,mediaScan,(message,refresh) -> {
                 String visibleMessage = message;
                 if (message.startsWith("扫描完成") && !markerStatus.isEmpty()) visibleMessage += " · " + markerStatus;
                 status(visibleMessage);
@@ -350,6 +386,7 @@ public final class MainActivity extends Activity {
     @Override protected void onActivityResult(int request,int result,Intent data) {
         super.onActivityResult(request,result,data);
         if(request==13){finishMediaDelete(result==RESULT_OK);return;}
+        if(request==17){Uri expected=pendingScanAuthorizationTree;pendingScanAuthorizationTree=null;if(result!=RESULT_OK||data==null||data.getData()==null){status("已取消扫描目录授权，现有资料保持不变。");return;}Uri tree=data.getData();if(expected==null||!StorageAccess.sameTree(expected,tree)){toast("请选择同一个扫描文件夹；扫描配置未更改。");return;}try{StorageAccess.persist(this,tree,data.getFlags());Uri canonical=StorageAccess.treeOf(tree);db.addScanRoot(canonical.toString(),directoryName(canonical));scan();}catch(Exception error){toast("扫描目录授权失败："+safeError(error));}return;}
         if(request==14){Uri expected=pendingAuthorizationTree;pendingAuthorizationTree=null;
             if(result!=RESULT_OK||data==null||data.getData()==null){status("已取消文件夹授权，未删除文件。");return;}
             Uri tree=data.getData();if(expected==null||!StorageAccess.sameTree(expected,tree)){toast("请选择原视频所在的同一个文件夹；本次没有更换扫描范围，也没有删除文件。");return;}
@@ -359,9 +396,12 @@ public final class MainActivity extends Activity {
                     .setPositiveButton("重新检查重复文件",(selection,which)->findDuplicates()).setNegativeButton("稍后",null).create();dialog.show();roundDialog(dialog);
             }catch(Exception error){toast("目录授权失败："+safeError(error));}return;}
         if(result!=RESULT_OK||data==null||data.getData()==null)return;Uri uri=data.getData();
-        if(request==11) {try{StorageAccess.Directory access=StorageAccess.persist(this,uri,data.getFlags());String name="已授权的视频目录";Uri document=android.provider.DocumentsContract.buildDocumentUriUsingTree(uri,android.provider.DocumentsContract.getTreeDocumentId(uri));try(android.database.Cursor row=getContentResolver().query(document,new String[]{android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME},null,null,null)){if(row!=null&&row.moveToFirst()&&row.getString(0)!=null)name=row.getString(0);}getPreferences(MODE_PRIVATE).edit().putString("directory",uri.toString()).putString("directory_name",name).putString("scan_scope","tree").apply();scan();if(!access.write)deletionBlocked(new StorageAccess.Deletion(false,false,"已保存读取授权，可以扫描和播放；系统没有授予写入权限，未能创建 .nomedia，也暂时不能下载到此目录或删除文件",uri));}catch(Exception error){toast("目录授权失败："+safeError(error));}}
+        if(request==11) {try{StorageAccess.Directory access=StorageAccess.persist(this,uri,data.getFlags());String name=directoryName(uri);db.addScanRoot(StorageAccess.treeOf(uri).toString(),name);android.content.SharedPreferences.Editor edit=getPreferences(MODE_PRIVATE).edit().putString("directory",StorageAccess.treeOf(uri).toString()).putString("directory_name",name).putString("scan_scope","tree").putBoolean("scan_roots_migrated",true);if(access.write)edit.putString("receive_directory",StorageAccess.treeOf(uri).toString()).putString("receive_directory_name",name);edit.apply();scan();if(!access.write)toast("扫描读取授权已保存；系统未授予写入权限，尚未将此位置设为接收目录，也无法创建 .nomedia");}catch(Exception error){toast("目录授权失败："+safeError(error));}}
+        else if(request==15) {try{StorageAccess.Directory access=StorageAccess.persist(this,uri,data.getFlags());if(!access.write){toast("系统只授予读取权限，不能把该目录设为接收 / 下载目录；设置未更改。");return;}Uri tree=StorageAccess.treeOf(uri);String name=directoryName(tree);getPreferences(MODE_PRIVATE).edit().putString("receive_directory",tree.toString()).putString("receive_directory_name",name).putString("scan_scope","tree").apply();db.addScanRoot(tree.toString(),name);scan();}catch(Exception error){toast("接收目录授权失败："+safeError(error));}}
+        else if(request==16) {try{StorageAccess.Directory access=StorageAccess.persist(this,uri,data.getFlags());Uri tree=StorageAccess.treeOf(uri);String name=directoryName(tree);db.addScanRoot(tree.toString(),name);getPreferences(MODE_PRIVATE).edit().putString("scan_scope","tree").putBoolean("scan_roots_migrated",true).apply();if(selectedDirectory()==null&&access.write)getPreferences(MODE_PRIVATE).edit().putString("receive_directory",tree.toString()).putString("receive_directory_name",name).apply();scan();}catch(Exception error){toast("扫描目录授权失败："+safeError(error));}}
         else if(request==12)runTask(() -> {File file=new File(getCacheDir(),"import-"+UUID.randomUUID()+".sqlite");try(InputStream input=getContentResolver().openInputStream(uri)){copy(input,file,64*1024*1024);db.importCatalogue(file);new VideoScanner(getApplicationContext(),db,cancelled).match((message,refresh) -> {status(message);if(refresh)ui.post(() -> refresh(true));});}finally{file.delete();}});
     }
+    private String directoryName(Uri tree){String name="已授权的视频目录";try{Uri document=android.provider.DocumentsContract.buildDocumentUriUsingTree(tree,android.provider.DocumentsContract.getTreeDocumentId(tree));try(android.database.Cursor row=getContentResolver().query(document,new String[]{android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME},null,null,null)){if(row!=null&&row.moveToFirst()&&row.getString(0)!=null)name=row.getString(0);}}catch(Exception ignored){}return name;}
     private void runTask(CheckedTask task) {
         if(busy||!pendingMediaDelete.isEmpty()){toast("已有操作进行中，可在设置里暂停扫描");return;}busy=true;cancelled.set(false);
         work.execute(() -> {try{task.run();}catch(InterruptedException error){status("扫描已暂停，已完成结果保留。");}catch(Exception error){status("操作失败："+safeError(error));}finally{ui.post(() -> {busy=false;refresh(true);ui.removeCallbacks(hideStatus);ui.postDelayed(hideStatus,5000);});}});
@@ -394,21 +434,43 @@ public final class MainActivity extends Activity {
         else if(!mediaMode||Build.VERSION.SDK_INT<29){toast("请先到资料管理中选择可写的视频文件夹");return;}
         final String source=sourceFilter;
         runTask(()->{
-            status("正在从 "+(source.equals("all")?"全部来源":source.equals("han1")?"Han1":"Iwara")+"随机挑选视频…");
-            JSONObject requestBody=new JSONObject();requestBody.put("count",count);requestBody.put("source",source);JSONArray excluded=new JSONArray();for(String id:db.downloadedTaskIds())excluded.put(id);requestBody.put("excludeTaskIds",excluded);
-            HttpURLConnection planResponse=postJson("/api/mobile/random-download",requestBody);JSONObject plan;
-            try(InputStream input=planResponse.getInputStream()){plan=new JSONObject(readSmallResponse(input,4*1024*1024));}finally{planResponse.disconnect();}
+            android.content.SharedPreferences preferences=getPreferences(MODE_PRIVATE);
+            String storedPlan=preferences.getString("active_v2_transfer_plan","");JSONObject plan;
+            if(!storedPlan.isEmpty()){
+                plan=new JSONObject(storedPlan);status("正在恢复上次未确认的传输任务…");
+                if(!plan.optString("source",source).equals(source)&&!"all".equals(source))throw new IOException("存在未完成的 "+plan.optString("source")+" 来源传输；请先从相同来源恢复");
+            }else{
+                status("正在从 "+(source.equals("all")?"全部来源":source.equals("han1")?"Han1":"Iwara")+"随机挑选视频…");
+                String requestKey=UUID.randomUUID().toString();JSONObject requestBody=new JSONObject();requestBody.put("count",count);requestBody.put("source",source);requestBody.put("protocolVersion",2);requestBody.put("requestKey",requestKey);JSONArray excluded=new JSONArray();for(String id:db.downloadedTaskIds())excluded.put(id);requestBody.put("excludeTaskIds",excluded);
+                HttpURLConnection planResponse=postJson("/api/mobile/random-download",requestBody);
+                try(InputStream input=planResponse.getInputStream()){plan=new JSONObject(readSmallResponse(input,4*1024*1024));}finally{planResponse.disconnect();}
+                if(!plan.optString("transferId").matches("[a-f0-9-]{36}"))throw new IOException("电脑没有返回可恢复的传输任务编号");
+                preferences.edit().putString("active_v2_transfer_id",plan.optString("transferId")).putString("active_v2_transfer_plan",plan.toString()).apply();
+            }
             JSONArray batches=plan.optJSONArray("batches");int selected=plan.optInt("selectedCount");if(selected<=0||selected>100||batches==null||batches.length()==0){throw new IOException("当前来源没有可下载的新视频"+(plan.optInt("oversizeSkipped")>0?"；超出单包 4.5 GB 的单个视频已跳过":""));}
             int plannedFiles=0;for(int i=0;i<batches.length();i++){JSONObject batch=batches.getJSONObject(i);int countInBatch=batch.optInt("fileCount",-1);long mediaBytes=batch.optLong("totalBytes",-1);if(countInBatch<1||countInBatch>100||mediaBytes<=0||mediaBytes>4_500_000_000L)throw new IOException("电脑返回的分包清单无效");plannedFiles+=countInBatch;}if(plannedFiles!=selected)throw new IOException("电脑返回的分包数量与随机清单不一致");
-            int completed=0;long totalMedia=0;for(int i=0;i<batches.length();i++){final int batchNumber=i+1;final int batchCount=batches.length();JSONObject batch=batches.getJSONObject(i);String route=batch.optString("url","");if(!route.matches("/batch-download/[a-f0-9]{36}\\.zip"))throw new IOException("电脑返回的分包链接无效");long archiveBytes=batch.optLong("archiveBytes",-1);if(archiveBytes<=0||archiveBytes>4_600_000_000L)throw new IOException("电脑返回的分包大小异常");status("随机下载 · 第 "+batchNumber+" / "+batchCount+" 包 · "+batch.optInt("fileCount")+" 个视频 · "+formatBytes(batch.optLong("totalBytes")));
-                HttpURLConnection transfer=null;try{transfer=openMobileBatch(route);long responseBytes=transfer.getContentLengthLong();if(responseBytes>=0&&responseBytes!=archiveBytes)throw new IOException("分包长度与电脑清单不一致");long expected=responseBytes>=0?responseBytes:archiveBytes;MobileBatchDownloader receiver=new MobileBatchDownloader(getApplicationContext(),db,cancelled,tree,mediaMode);int added;try(InputStream input=transfer.getInputStream()){added=receiver.receive(input,expected,(received,total,current)->{if(total>0)status("第 "+batchNumber+" / "+batchCount+" 包 · "+(int)Math.min(100,received*100/total)+"% · "+current);});}completed+=added;totalMedia+=batch.optLong("totalBytes");if(added!=batch.optInt("fileCount"))throw new IOException("本包已接收但登记数量与电脑清单不一致");}catch(InterruptedException error){throw error;}catch(Exception error){if(completed>0)throw new IOException("已安全完成并登记 "+completed+" 个视频；剩余分包失败，可重新发起（已入库项目会自动跳过）："+safeError(error),error);throw error;}finally{if(transfer!=null)transfer.disconnect();}
+            int completed=0;long totalMedia=0;String transferId=plan.optString("transferId");for(int i=0;i<batches.length();i++){final int batchNumber=i+1;final int batchCount=batches.length();JSONObject batch=batches.getJSONObject(i);String batchId=batch.optString("batchId","");if(!batchId.matches("[a-f0-9-]{36}"))throw new IOException("电脑返回的持久批次编号无效");String route="/api/mobile/transfers/"+transferId+"/batches/"+batchId+"/archive";long archiveBytes=batch.optLong("archiveBytes",-1);if(archiveBytes<=0||archiveBytes>4_600_000_000L)throw new IOException("电脑返回的分包大小异常");status("随机下载 · 第 "+batchNumber+" / "+batchCount+" 包 · "+batch.optInt("fileCount")+" 个视频 · "+formatBytes(batch.optLong("totalBytes")));
+                HttpURLConnection transfer=null;try{boolean alreadyPresent=true;JSONArray batchTasks=batch.optJSONArray("taskIds");if(batchTasks==null||batchTasks.length()!=batch.optInt("fileCount"))throw new IOException("电脑返回的冻结任务清单不完整");java.util.HashSet<String> phoneTasks=new java.util.HashSet<>(db.downloadedTaskIds());for(int taskIndex=0;taskIndex<batchTasks.length();taskIndex++)if(!phoneTasks.contains(batchTasks.getString(taskIndex))){alreadyPresent=false;break;}
+                    if(!alreadyPresent){transfer=openMobileBatch(route);long responseBytes=transfer.getContentLengthLong();if(responseBytes>=0&&responseBytes!=archiveBytes)throw new IOException("分包长度与电脑清单不一致");long expected=responseBytes>=0?responseBytes:archiveBytes;MobileBatchDownloader receiver=new MobileBatchDownloader(getApplicationContext(),db,cancelled,tree,mediaMode);int added;try(InputStream input=transfer.getInputStream()){added=receiver.receive(input,expected,(received,total,current)->{if(total>0)status("第 "+batchNumber+" / "+batchCount+" 包 · "+(int)Math.min(100,received*100/total)+"% · "+current);});}if(added!=batch.optInt("fileCount"))throw new IOException("本包已接收但登记数量与电脑清单不一致");completed+=added;}
+                    confirmDownloadedBatch(transferId,batchId);totalMedia+=batch.optLong("totalBytes");
+                }catch(InterruptedException error){throw error;}catch(Exception error){throw new IOException((completed>0?"已安全登记 "+completed+" 个视频；":"")+"本批未收到电脑确认，原任务已保留，可再次点击随机下载续传："+safeError(error),error);}finally{if(transfer!=null)transfer.disconnect();}
             }
             String extra=plan.optInt("oversizeSkipped")>0?"；跳过 "+plan.optInt("oversizeSkipped")+" 个单文件超过 4.5 GB 的项目":"";if(plan.optInt("unavailableSkipped")>0)extra+="；文件变动/不可用跳过 "+plan.optInt("unavailableSkipped")+" 项";
+            preferences.edit().remove("active_v2_transfer_id").remove("active_v2_transfer_plan").apply();
             status("完成 · 已下载并登记 "+completed+" 个视频 · "+formatBytes(totalMedia)+extra);
         });
     }
+    private void confirmDownloadedBatch(String transferId,String batchId)throws Exception{
+        HttpURLConnection statusResponse=request("/api/mobile/transfers/"+transferId,"GET");JSONObject transfer;
+        try(InputStream input=statusResponse.getInputStream()){transfer=new JSONObject(readSmallResponse(input,4*1024*1024));}finally{statusResponse.disconnect();}
+        JSONArray batches=transfer.optJSONArray("batches");JSONObject selected=null;if(batches!=null)for(int i=0;i<batches.length();i++){JSONObject item=batches.getJSONObject(i);if(batchId.equals(item.optString("id"))){selected=item;break;}}
+        if(selected==null)throw new IOException("电脑传输任务中找不到本批记录");JSONArray files=selected.optJSONArray("files");if(files==null||files.length()==0)throw new IOException("电脑传输任务没有本批文件清单");
+        JSONArray receipts=new JSONArray();for(int i=0;i<files.length();i++){JSONObject file=new JSONObject(files.getJSONObject(i).toString());file.put("state","indexed");receipts.put(file);}
+        JSONObject body=new JSONObject();body.put("files",receipts);HttpURLConnection confirm=postJson("/api/mobile/transfers/"+transferId+"/batches/"+batchId+"/confirm",body);confirm.disconnect();
+    }
     private HttpURLConnection openMobileBatch(String route) throws Exception {
-        String token=connection.token();if(token.isEmpty())throw new IllegalArgumentException("请先设置带令牌的电脑服务连接");HttpURLConnection response=(HttpURLConnection)new URL(connection.origin()+route).openConnection();response.setRequestMethod("GET");response.setConnectTimeout(15000);response.setReadTimeout(120000);response.setInstanceFollowRedirects(false);response.setRequestProperty("x-iwara-access-token",token);int code=response.getResponseCode();if(code!=200){response.disconnect();throw new IOException(code==404?"随机分包链接已过期，请重新发起下载":"分包传输失败 HTTP "+code);}String type=response.getContentType();if(type==null||!type.toLowerCase(Locale.ROOT).startsWith("application/zip")){response.disconnect();throw new IOException("电脑返回的不是 ZIP 视频分包");}return response;
+        String token=connection.token();if(token.isEmpty())throw new IllegalArgumentException("请先设置带令牌的电脑服务连接");URL base=new URL(connection.origin());String current=route;
+        for(int redirects=0;redirects<3;redirects++){HttpURLConnection response=(HttpURLConnection)new URL(base,current).openConnection();response.setRequestMethod("GET");response.setConnectTimeout(15000);response.setReadTimeout(120000);response.setInstanceFollowRedirects(false);response.setRequestProperty("x-iwara-access-token",token);int code=response.getResponseCode();if(code==301||code==302||code==303||code==307||code==308){String location=response.getHeaderField("Location");response.disconnect();if(location==null)throw new IOException("电脑没有返回分包地址");URL redirected=new URL(base,location);if(!base.getProtocol().equalsIgnoreCase(redirected.getProtocol())||!base.getHost().equalsIgnoreCase(redirected.getHost())||base.getPort()!=redirected.getPort())throw new IOException("电脑返回了跨站分包地址，已阻止发送令牌");current=redirected.toString();continue;}if(code!=200){response.disconnect();throw new IOException(code==404?"随机分包链接已过期，请重试原任务":"分包传输失败 HTTP "+code);}String type=response.getContentType();if(type==null||!type.toLowerCase(Locale.ROOT).startsWith("application/zip")){response.disconnect();throw new IOException("电脑返回的不是 ZIP 视频分包");}return response;}throw new IOException("分包地址重定向次数过多");
     }
     private String readSmallResponse(InputStream input,int limit)throws Exception{ByteArrayOutputStream bytes=new ByteArrayOutputStream();byte[] buffer=new byte[8192];int length;while((length=input.read(buffer))!=-1){if(bytes.size()+length>limit)throw new IOException("电脑返回的分包资料过大");bytes.write(buffer,0,length);}return bytes.toString("UTF-8");}
     private String formatBytes(long bytes){if(bytes<1024*1024)return bytes+" B";if(bytes<1024L*1024*1024)return String.format(Locale.ROOT,"%.1f MB",bytes/1048576.0);return String.format(Locale.ROOT,"%.2f GB",bytes/1073741824.0);}

@@ -11,13 +11,14 @@ import java.util.ArrayList;
 import java.util.List;
 
 public final class LibraryDb extends SQLiteOpenHelper {
-    public LibraryDb(Context context) { super(context, "phone-library.sqlite", null, 3); }
+    public LibraryDb(Context context) { super(context, "phone-library.sqlite", null, 4); }
     @Override public void onCreate(SQLiteDatabase db) {
         db.execSQL("CREATE TABLE catalogue(task_id TEXT PRIMARY KEY,video_id TEXT,title TEXT,author TEXT,upload_time INTEGER,views INTEGER,tags TEXT,size INTEGER,sha256 TEXT,sample_sha256 TEXT,download_time INTEGER,source TEXT NOT NULL DEFAULT 'other')");
         db.execSQL("CREATE INDEX catalogue_hash ON catalogue(sha256)");
         db.execSQL("CREATE INDEX catalogue_sample ON catalogue(size,sample_sha256)");
-        db.execSQL("CREATE TABLE local_files(uri TEXT PRIMARY KEY,name TEXT,size INTEGER,modified INTEGER,sha256 TEXT,sample_sha256 TEXT,task_id TEXT,match_status TEXT NOT NULL DEFAULT 'pending',hidden INTEGER NOT NULL DEFAULT 0,available INTEGER NOT NULL DEFAULT 1,seen INTEGER)");
+        db.execSQL("CREATE TABLE local_files(uri TEXT PRIMARY KEY,name TEXT,size INTEGER,modified INTEGER,sha256 TEXT,sample_sha256 TEXT,task_id TEXT,match_status TEXT NOT NULL DEFAULT 'pending',hidden INTEGER NOT NULL DEFAULT 0,available INTEGER NOT NULL DEFAULT 1,seen INTEGER,scan_root TEXT)");
         db.execSQL("CREATE TABLE catalogue_meta(key TEXT PRIMARY KEY,value TEXT)");
+        db.execSQL("CREATE TABLE scan_roots(uri TEXT PRIMARY KEY,label TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,updated_at INTEGER NOT NULL)");
     }
     @Override public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
         if (oldVersion < 2) db.execSQL("ALTER TABLE catalogue ADD COLUMN download_time INTEGER");
@@ -26,8 +27,30 @@ public final class LibraryDb extends SQLiteOpenHelper {
             db.execSQL("UPDATE catalogue SET source='han1' WHERE lower(COALESCE(video_id,'')) LIKE 'han1meview-%'");
             db.execSQL("UPDATE catalogue SET source='iwara' WHERE COALESCE(video_id,'')<>'' AND lower(video_id) NOT LIKE 'han1meview-%' AND lower(video_id) NOT LIKE 'local-%'");
         }
-        if (newVersion > 3) throw new IllegalStateException("不支持的数据库版本");
+        if (oldVersion < 4) {
+            db.execSQL("ALTER TABLE local_files ADD COLUMN scan_root TEXT");
+            db.execSQL("CREATE TABLE scan_roots(uri TEXT PRIMARY KEY,label TEXT NOT NULL,enabled INTEGER NOT NULL DEFAULT 1,updated_at INTEGER NOT NULL)");
+        }
+        if (newVersion > 4) throw new IllegalStateException("不支持的数据库版本");
     }
+    public static final class ScanRoot {
+        public final String uri, label;
+        public ScanRoot(String uri, String label) { this.uri=uri; this.label=label; }
+    }
+    public synchronized List<ScanRoot> scanRoots() {
+        List<ScanRoot> result = new ArrayList<>();
+        try (Cursor rows = getReadableDatabase().rawQuery("SELECT uri,label FROM scan_roots WHERE enabled=1 ORDER BY updated_at,uri", null)) {
+            while (rows.moveToNext()) result.add(new ScanRoot(rows.getString(0), rows.getString(1)));
+        }
+        return result;
+    }
+    public synchronized void addScanRoot(String uri, String label) {
+        if (uri == null || uri.isEmpty()) throw new IllegalArgumentException("扫描目录 URI 为空");
+        ContentValues value = new ContentValues(); value.put("uri", uri); value.put("label", label == null || label.isEmpty() ? "已授权目录" : label);
+        value.put("enabled", 1); value.put("updated_at", System.currentTimeMillis());
+        getWritableDatabase().insertWithOnConflict("scan_roots", null, value, SQLiteDatabase.CONFLICT_REPLACE);
+    }
+    public synchronized void removeScanRoot(String uri) { getWritableDatabase().delete("scan_roots", "uri=?", new String[]{uri}); }
     public synchronized int importCatalogue(File file) throws Exception {
         SQLiteDatabase incoming = SQLiteDatabase.openDatabase(file.getPath(), null, SQLiteDatabase.OPEN_READONLY);
         SQLiteDatabase db = getWritableDatabase();
@@ -69,9 +92,10 @@ public final class LibraryDb extends SQLiteOpenHelper {
             } finally { db.endTransaction(); }
         } finally { incoming.close(); }
     }
-    public synchronized void discovered(String uri, String name, long size, long modified, long scan) {
+    public synchronized void discovered(String uri, String name, long size, long modified, long scan) { discovered(uri,name,size,modified,scan,null); }
+    public synchronized void discovered(String uri, String name, long size, long modified, long scan, String scanRoot) {
         SQLiteDatabase db = getWritableDatabase(); ContentValues value = new ContentValues();
-        value.put("name", name); value.put("size", size); value.put("modified", modified); value.put("seen", scan); value.put("available", 1);
+        value.put("name", name); value.put("size", size); value.put("modified", modified); value.put("seen", scan); value.put("available", 1); value.put("scan_root",scanRoot);
         try (Cursor old = db.rawQuery("SELECT size,modified FROM local_files WHERE uri=?", new String[]{uri})) {
             if (old.moveToFirst()) {
                 if (old.getLong(0) != size || old.getLong(1) != modified) { value.putNull("sha256"); value.putNull("sample_sha256"); value.putNull("task_id"); value.put("match_status", "pending"); }
@@ -79,7 +103,17 @@ public final class LibraryDb extends SQLiteOpenHelper {
             } else { value.put("uri", uri); db.insertOrThrow("local_files", null, value); }
         }
     }
-    public synchronized void finishDiscovery(long scan) { ContentValues value = new ContentValues(); value.put("available", 0); getWritableDatabase().update("local_files", value, "seen<>?", new String[]{String.valueOf(scan)}); }
+    public synchronized void finishDiscovery(long scan, List<String> roots, boolean mediaStore) {
+        ArrayList<String> active = new ArrayList<>();
+        if (roots != null) active.addAll(roots);
+        if (mediaStore) active.add("media");
+        if (active.isEmpty()) return;
+        StringBuilder selection = new StringBuilder("seen<>? AND scan_root IN (");
+        String[] args = new String[active.size()+1]; args[0]=String.valueOf(scan);
+        for (int i=0;i<active.size();i++) { if(i>0)selection.append(','); selection.append('?'); args[i+1]=active.get(i); }
+        selection.append(')'); ContentValues value = new ContentValues(); value.put("available",0);
+        getWritableDatabase().update("local_files",value,selection.toString(),args);
+    }
     public synchronized void fingerprint(String uri, String sample, String full) {
         ContentValues value = new ContentValues(); value.put("sample_sha256", sample); if (full != null) value.put("sha256", full);
         getWritableDatabase().update("local_files", value, "uri=?", new String[]{uri});

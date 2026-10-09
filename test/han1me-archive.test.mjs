@@ -9,6 +9,8 @@ import { Readable } from "node:stream";
 import { deflateRawSync } from "node:zlib";
 import { createServer, authorizeRequest } from "../src/server.mjs";
 import { receiveHan1meArchive } from "../src/han1me-archive.mjs";
+import { SQLiteStore } from "../src/sqlite-store.mjs";
+import { StorageTransferStore } from "../src/storage-transfer-store.mjs";
 
 const crcTable = new Uint32Array(256);
 for (let n = 0; n < 256; n++) {
@@ -138,6 +140,42 @@ function postArchive(port, zip, contentType = "application/zip") {
   });
 }
 
+function apiRequest(port, pathname, method, body, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const payload = Buffer.isBuffer(body) ? body : body == null ? null : Buffer.from(JSON.stringify(body));
+    const requestHeaders = { ...headers };
+    if (payload) requestHeaders["content-length"] = payload.length;
+    if (body != null && !requestHeaders["content-type"]) requestHeaders["content-type"] = Buffer.isBuffer(body) ? "application/zip" : "application/json";
+    const req = http.request({ hostname: "127.0.0.1", port, path: pathname, method, headers: requestHeaders }, response => {
+      const chunks = [];
+      response.on("data", chunk => chunks.push(chunk));
+      response.on("end", () => resolve({ status: response.statusCode, body: Buffer.concat(chunks).toString("utf8") }));
+    });
+    req.on("error", reject);
+    req.end(payload);
+  });
+}
+
+function v2Archive(code, transferId) {
+  const files = [
+    { path: `${code}/video.mp4`, contents: Buffer.alloc(65_536, 0x35), role: "media" },
+    { path: `${code}/cover.png`, contents: Buffer.from("isolated-cover"), role: "cover" },
+    { path: `${code}/info.json`, contents: Buffer.from(JSON.stringify({ id: code, title: "v2 isolated", artist: "test" })), role: "metadata" },
+  ];
+  const manifest = {
+    type: "han1meviewer-archive", version: 2, transferId,
+    videos: [{ code, title: "v2 isolated" }],
+    files: files.map(file => ({
+      source: "han1", sourceId: code, taskId: "", role: file.role, path: file.path,
+      size: file.contents.length, sha256: hash(file.contents),
+    })),
+  };
+  return {
+    files,
+    zip: zipStored([...files.map(file => [file.path, file.contents]), ["manifest.json", JSON.stringify(manifest)]], true),
+  };
+}
+
 test("Han1me archive extracts video, PNG and info.json and repeated upload is idempotent", async () => {
   const parent = await mkdtemp(path.join(tmpdir(), "iwara-han1me-archive-"));
   const root = path.join(parent, "hanime_download");
@@ -236,6 +274,57 @@ test("LAN archive endpoint stores files and retains the existing mobile code-syn
     assert.deepEqual(JSON.parse(synchronized.body).codes, ["987654", "987655"]);
   } finally {
     await service.close();
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
+test("Han v2 HTTP upload verifies the frozen ZIP, indexes files against a ledger row, and persists its receipt", async () => {
+  const parent = await mkdtemp(path.join(tmpdir(), "iwara-han-v2-http-"));
+  const root = path.join(parent, "han-receive");
+  const code = "567890123";
+  const repository = { id: "han-isolated", name: "isolated", path: root, source: "han1", enabled: true,
+    roles: ["receive", "scan", "serve"], priority: 1, minimumFreeBytes: 0 };
+  const db = new SQLiteStore({ filePath: path.join(parent, "ledger.sqlite"), legacyJsonPath: path.join(parent, "none.json"), backupRoot: path.join(parent, "backups") });
+  await db.load();
+  db.state.tasks.push({ id: "fixture-task", videoId: `han1meview-${code}`, sourcePlatform: "han1meview", state: "completed", title: "isolated fixture" });
+  const transfers = new StorageTransferStore(db.db);
+  const importer = { scan: async () => ({}), stop: async () => {} };
+  const service = createServer({
+    scheduler: { status: () => ({}), config: { storageRepositories: [repository] }, store: db },
+    storageTransferStore: transfers, han1meImporter: importer, host: "127.0.0.1", port: 0,
+    accessToken: "isolated-only-token", onShutdown() {},
+  });
+  await service.listen();
+  const port = service.server.address().port;
+  try {
+    const archiveFiles = v2Archive(code, "00000000-0000-4000-8000-000000000000").files;
+    const files = archiveFiles.map(file => ({ source: "han1", sourceId: code, taskId: "", role: file.role,
+      relativePath: file.path, size: file.contents.length, sha256: hash(file.contents) }));
+    const created = await apiRequest(port, "/api/mobile/transfers", "POST", {
+      direction: "upload", source: "han1", repositoryId: repository.id, requestKey: "isolated-v2-upload", files,
+    }, { "x-iwara-access-token": "isolated-only-token" });
+    assert.equal(created.status, 201, created.body);
+    const plan = JSON.parse(created.body);
+    const archive = v2Archive(code, plan.id);
+    const batch = plan.batches[0];
+    const uploaded = await apiRequest(port, `/api/mobile/transfers/${plan.id}/batches/${batch.id}/archive`, "PUT", archive.zip,
+      { "content-type": "application/zip", "x-iwara-access-token": "isolated-only-token" });
+    assert.equal(uploaded.status, 200, uploaded.body);
+    assert.equal(JSON.parse(uploaded.body).saved, true);
+
+    const recovered = await apiRequest(port, `/api/mobile/transfers/${plan.id}`, "GET", null,
+      { "x-iwara-access-token": "isolated-only-token" });
+    assert.equal(recovered.status, 200, recovered.body);
+    const result = JSON.parse(recovered.body);
+    assert.equal(result.state, "confirmed");
+    assert.deepEqual(result.batches[0].files.map(file => file.state), ["indexed", "indexed", "indexed"]);
+    assert.equal(result.batches[0].payload.archiveBytes, archive.zip.length);
+    for (const file of archive.files) assert.deepEqual(await readFile(path.join(root, file.path)), file.contents);
+    assert.deepEqual((await readdir(parent)).filter(name => name.startsWith(".han1me-archive-") || name.startsWith(".han1me-")), [],
+      "the temporary ZIP and extraction tree are removed after commit");
+  } finally {
+    await service.close();
+    db.close();
     await rm(parent, { recursive: true, force: true });
   }
 });

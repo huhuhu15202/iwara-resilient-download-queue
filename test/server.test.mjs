@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { Script } from "node:vm";
 import { mkdir, mkdtemp, readdir, rm, truncate, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -14,6 +15,8 @@ import {
   partitionMobileDownloadBatches
 } from "../src/server.mjs";
 import { issueResourceTicket, verifyResourceTicket, RESOURCE_TICKET_LIFETIME_MS } from "../src/resource-ticket.mjs";
+import { SQLiteStore } from "../src/sqlite-store.mjs";
+import { StorageTransferStore } from "../src/storage-transfer-store.mjs";
 
 function request(port, path, headers = {}, method = "GET", body = null) {
   return new Promise((resolve, reject) => {
@@ -259,6 +262,78 @@ test("mobile Han1me download-code endpoint returns only the PC media IDs", async
   } finally { await service.close(); }
 });
 
+test("dashboard repository editor renders editable fields and valid client script", async () => {
+  const service = createServer({ scheduler: { status: () => ({}) }, host: "127.0.0.1", port: 0, onShutdown() {} });
+  await service.listen();
+  try {
+    const response = await request(service.server.address().port, "/");
+    assert.equal(response.status, 200);
+    assert.match(response.body, /storageRepositoryRows/);
+    assert.match(response.body, /添加仓库/);
+    assert.doesNotMatch(response.body, /storageRepositoryJson/);
+    const scripts = [...response.body.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/gi)].map(match => match[1]).filter(Boolean);
+    for (const script of scripts) assert.doesNotThrow(() => new Script(script));
+  } finally { await service.close(); }
+});
+
+test("mobile v2 Han receipt indexes exact files by role and never exposes repository paths", async () => {
+  const tempRoot = await mkdtemp(path.join(tmpdir(), "iwara-mobile-v2-han-"));
+  const repositoryPath = path.join(tempRoot, "han-receive");
+  await mkdir(path.join(repositoryPath, "102355"), { recursive: true });
+  const videoBytes = Buffer.alloc(96 * 1024, 37);
+  const coverBytes = Buffer.from("isolated-cover-fixture");
+  const videoPath = path.join(repositoryPath, "102355", "video.mp4");
+  const coverPath = path.join(repositoryPath, "102355", "cover.png");
+  await writeFile(videoPath, videoBytes);
+  await writeFile(coverPath, coverBytes);
+  const store = new SQLiteStore({ filePath: path.join(tempRoot, "ledger.sqlite"), legacyJsonPath: path.join(tempRoot, "missing.json"), backupRoot: path.join(tempRoot, "backups") });
+  let service;
+  try {
+    await store.load();
+    store.state.tasks.push({ id: "han-task-102355", videoId: "han1meview-102355", sourcePlatform: "han1meview",
+      state: "completed", destination: videoPath, title: "isolated fixture", author: "tester", tags: [] });
+    const repository = { id: "han-test", name: "Han 测试仓库", path: repositoryPath, source: "han1", enabled: true,
+      roles: ["receive", "scan", "serve"], priority: 1, minimumFreeBytes: 0 };
+    const transferStore = new StorageTransferStore(store.db);
+    service = createServer({ scheduler: { status: () => ({}), config: { storageRepositories: [repository] }, store },
+      storageTransferStore: transferStore, host: "127.0.0.1", port: 0, onShutdown() {} });
+    await service.listen();
+    const port = service.server.address().port;
+    const capabilities = await request(port, "/api/mobile/capabilities");
+    assert.equal(capabilities.status, 200);
+    assert.equal(capabilities.body.includes(repositoryPath), false);
+    assert.equal(JSON.parse(capabilities.body).repositories.some(item => item.id === repository.id && item.roles.includes("receive")), true);
+
+    const files = [
+      { source: "han1", sourceId: "102355", taskId: "han-task-102355", role: "media", relativePath: "102355/video.mp4", size: videoBytes.length,
+        sha256: createHash("sha256").update(videoBytes).digest("hex") },
+      { source: "han1", sourceId: "102355", taskId: "han-task-102355", role: "cover", relativePath: "102355/cover.png", size: coverBytes.length,
+        sha256: createHash("sha256").update(coverBytes).digest("hex") },
+    ];
+    const created = await request(port, "/api/mobile/transfers", {}, "POST", {
+      direction: "upload", source: "han1", repositoryId: repository.id, requestKey: "han-fixture-v2", files,
+    });
+    assert.equal(created.status, 201, created.body);
+    const plan = JSON.parse(created.body);
+    assert.equal(plan.batches.length, 1);
+    const batch = plan.batches[0];
+    const confirmPath = `/api/mobile/transfers/${plan.id}/batches/${batch.id}/confirm`;
+    const confirmed = await request(port, confirmPath, {}, "POST", { files });
+    assert.equal(confirmed.status, 200, confirmed.body);
+    assert.equal(JSON.parse(confirmed.body).state, "confirmed");
+
+    const retry = await request(port, confirmPath, {}, "POST", { files: files.map(file => ({ ...file, state: "saved" })) });
+    assert.equal(retry.status, 200, retry.body);
+    const persisted = JSON.parse(retry.body);
+    assert.equal(persisted.state, "confirmed");
+    assert.deepEqual(persisted.batches[0].files.map(file => file.state), ["indexed", "indexed"]);
+  } finally {
+    await service?.close();
+    store.close();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 test("remote media releases cache leases on HEAD, range errors and disconnected clients", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "iwara-media-pin-"));
   const file = path.join(root, "remote.mp4"); await writeFile(file, Buffer.alloc(1024 * 1024));
@@ -271,7 +346,7 @@ test("remote media releases cache leases on HEAD, range errors and disconnected 
     assert.equal((await request(port, "/media/a?profile=remote", { range: "bytes=999999999-" })).status, 416);
     assert.equal((await request(port, "/media/a?profile=remote", { range: "bytes=0-1023" })).status, 206);
     await new Promise((resolve, reject) => { const req = http.get({ hostname: "127.0.0.1", port, path: "/media/a?profile=remote" }, response => { response.once("data", () => { response.destroy(); req.destroy(); resolve(); }); }); req.on("error", error => error.code === "ECONNRESET" ? resolve() : reject(error)); });
-    await new Promise(resolve => setTimeout(resolve, 20));
+    for (let attempt = 0; attempt < 100 && released < 4; attempt++) await new Promise(resolve => setTimeout(resolve, 10));
     assert.equal(acquired, 4); assert.equal(released, 4);
   } finally { await service.close(); await rm(root, { recursive: true, force: true }); }
 });

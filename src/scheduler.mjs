@@ -8,6 +8,7 @@ import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { classifyError, isPermanentErrorCategory, failurePolicy, safeFailureMessage, retryAfterDelay } from "./failure-policy.mjs";
 import { downloadFilterMessage, matchesDownloadFilter } from "./download-filter.mjs";
+import { repositoryOwnsPath } from "./storage-repositories.mjs";
 export { classifyError, isPermanentErrorCategory } from "./failure-policy.mjs";
 
 function nowIso() {
@@ -325,6 +326,9 @@ export class Scheduler {
     this.onCompleted = onCompleted;
     this.diskSpaceProvider = diskSpaceProvider;
     this.volumeKeyProvider = volumeKeyProvider;
+    this.destinationReservations = new Map();
+    this.destinationReservationTail = Promise.resolve();
+    this.completingTasks = new Set();
     this.timer = null;
     this.reconcileTimer = null;
     this.reconcileCursor = 0;
@@ -1510,8 +1514,9 @@ export class Scheduler {
     await this.retryOrFail(task, message, true, { retryAfterMs: policy.retryAfterMs });
   }
 
-  async hasDownloadSpace(root, incomingBytes) {
-    const minimumFreeBytes = Math.max(0, Number(this.config.downloadMinimumFreeBytes) || 0);
+  async hasDownloadSpace(root, incomingBytes, taskId = "") {
+    const repository = (this.config.storageRepositories || []).find(item => item.enabled && item.roles?.includes("download") && path.resolve(item.path) === path.resolve(root));
+    const minimumFreeBytes = Math.max(0, Number(repository?.minimumFreeBytes ?? this.config.downloadMinimumFreeBytes) || 0);
     if (minimumFreeBytes === 0) return true;
     try {
       await mkdir(root, { recursive: true });
@@ -1523,7 +1528,11 @@ export class Scheduler {
       const sameVolumeAsStaging = stagingRoot
         && this.volumeKeyProvider(stagingRoot) === this.volumeKeyProvider(root);
       const additionalBytes = sameVolumeAsStaging ? 0 : Math.max(0, Number(incomingBytes) || 0);
-      return Number.isFinite(availableBytes) && availableBytes - additionalBytes >= minimumFreeBytes;
+      const volumeKey = this.volumeKeyProvider(root);
+      const alreadyReserved = [...this.destinationReservations.entries()]
+        .filter(([reservedTaskId, reservation]) => reservedTaskId !== taskId && reservation.volumeKey === volumeKey)
+        .reduce((total, [, reservation]) => total + reservation.bytes, 0);
+      return Number.isFinite(availableBytes) && availableBytes - additionalBytes - alreadyReserved >= minimumFreeBytes;
     } catch {
       // Fail closed when free space cannot be verified: finalization retries
       // later and keeps the completed download in staging rather than filling a disk.
@@ -1532,21 +1541,26 @@ export class Scheduler {
   }
 
   destinationRootFor(filePath) {
-    const roots = [this.config.downloadRoot, this.config.fallbackDownloadRoot]
-      .filter(value => typeof value === "string" && value.trim())
-      .map(value => path.resolve(value));
-    return roots.find(root => {
-      const relative = path.relative(root, path.resolve(filePath));
-      return relative && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
-    }) || "";
+    const repositories = this.config.storageRepositories || [];
+    if (repositories.length) {
+      const owner = repositoryOwnsPath(repositories, filePath, "scan");
+      return owner?.source === "iwara" && owner.roles.includes("download") ? owner.path : "";
+    }
+    return [this.config.downloadRoot, this.config.fallbackDownloadRoot].filter(Boolean).map(value => path.resolve(value))
+      .find(root => { const relative = path.relative(root, path.resolve(filePath)); return relative && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative); }) || "";
   }
 
   async chooseDownloadDestination(task, incomingBytes, preferredPath = "") {
-    const primaryRoot = path.resolve(this.config.downloadRoot);
-    const fallbackRoot = String(this.config.fallbackDownloadRoot || "").trim()
-      ? path.resolve(this.config.fallbackDownloadRoot)
-      : "";
-    const roots = [...new Set([primaryRoot, fallbackRoot].filter(Boolean))];
+    const previous = this.destinationReservationTail;
+    let release;
+    this.destinationReservationTail = new Promise(resolve => { release = resolve; });
+    await previous;
+    try {
+    const configuredRepositories = (this.config.storageRepositories || []).filter(repository => repository.enabled && repository.source === "iwara" && repository.roles.includes("download"))
+      .sort((left, right) => left.priority - right.priority);
+    const roots = configuredRepositories.length ? configuredRepositories.map(repository => path.resolve(repository.path))
+      : [...new Set([this.config.downloadRoot, this.config.fallbackDownloadRoot].filter(Boolean).map(value => path.resolve(value)))];
+    const primaryRoot = roots[0] || path.resolve(this.config.downloadRoot);
     const preferredRoot = preferredPath ? this.destinationRootFor(preferredPath) : "";
     const orderedRoots = preferredRoot
       ? [preferredRoot, ...roots.filter(root => root !== preferredRoot)]
@@ -1554,18 +1568,40 @@ export class Scheduler {
     const categoryFolder = task.categoryFolder || this.store.authorCategory?.(task.author) || "";
     task.categoryFolder = categoryFolder;
     for (const root of orderedRoots) {
-      if (!await this.hasDownloadSpace(root, incomingBytes)) continue;
+      if (!await this.hasDownloadSpace(root, incomingBytes, task.id)) continue;
       const requestedDestination = preferredRoot === root
         ? preferredPath
         : categoryFolder
           ? path.join(root, categoryFolder, task.resolved.relativePath)
           : path.join(root, task.resolved.relativePath);
-      return await availableDestination(requestedDestination);
+      const selected = await availableDestination(requestedDestination);
+      const stagingRoot = this.config.stagingRoot || this.config.dataRoot || "";
+      const sameVolumeAsStaging = stagingRoot
+        && this.volumeKeyProvider(stagingRoot) === this.volumeKeyProvider(root);
+      this.destinationReservations.set(task.id, {
+        volumeKey: this.volumeKeyProvider(root),
+        bytes: sameVolumeAsStaging ? 0 : Math.max(0, Number(incomingBytes) || 0)
+      });
+      return selected;
     }
     return "";
+    } finally {
+      release();
+    }
   }
 
   async complete(task) {
+    if (this.completingTasks.has(task.id)) return false;
+    this.completingTasks.add(task.id);
+    try {
+      return await this.completeWithReservation(task);
+    } finally {
+      this.destinationReservations.delete(task.id);
+      this.completingTasks.delete(task.id);
+    }
+  }
+
+  async completeWithReservation(task) {
     let destination = task.pendingDestination;
     const stagingInfo = task.stagingFile ? await fileInfo(task.stagingFile) : null;
     const incomingBytes = stagingInfo?.size ?? Number(task.totalLength || 0);
@@ -2242,8 +2278,12 @@ export class Scheduler {
 
   mediaCandidates(task) {
     const root = path.resolve(this.config.downloadRoot);
-    const allowedRoots = [root, ...(Array.isArray(this.config.externalMediaRoots) ? this.config.externalMediaRoots : [])]
-      .map(item => path.resolve(item));
+    const source = classifyMediaSource(task);
+    const allowedRoots = (this.config.storageRepositories || []).length
+      ? this.config.storageRepositories.filter(item => item.enabled &&
+        (item.roles.includes("scan") || item.roles.includes("serve")) &&
+        (source === "other" || item.source === source)).map(item => path.resolve(item.path))
+      : [root, ...(Array.isArray(this.config.externalMediaRoots) ? this.config.externalMediaRoots : [])].map(item => path.resolve(item));
     const original = path.resolve(task.destination);
     const candidates = [];
     const add = candidate => {
@@ -2284,9 +2324,10 @@ export class Scheduler {
 
   async buildMediaIndex() {
     const index = new Map();
-    const roots = [...new Set([this.config.downloadRoot, this.config.fallbackDownloadRoot]
-      .filter(value => typeof value === "string" && value.trim())
-      .map(value => path.resolve(value)))];
+    const repositories = this.config.storageRepositories || [];
+    const roots = repositories.length
+      ? [...new Set(repositories.filter(item => item.enabled && item.source === "iwara" && item.roles.includes("scan")).map(item => path.resolve(item.path)))]
+      : [...new Set([this.config.downloadRoot, this.config.fallbackDownloadRoot].filter(value => typeof value === "string" && value.trim()).map(value => path.resolve(value)))];
     const pending = [...roots];
     while (pending.length) {
       const directory = pending.pop();
@@ -2303,6 +2344,10 @@ export class Scheduler {
           continue;
         }
         if (!entry.isFile() || !/\.(?:mp4|webm|m4v|mov|mkv|avi)$/i.test(entry.name)) continue;
+        if (repositories.length) {
+          const owner = repositoryOwnsPath(repositories, filePath, "scan");
+          if (!owner || owner.source !== "iwara") continue;
+        }
         // Downloaded names carry the Iwara video ID in the final [id] part.
         // This remains useful when a prior categorization step sanitized the
         // title or changed the containing folder.

@@ -1,4 +1,4 @@
-import { access, mkdir, readFile, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -16,6 +16,10 @@ import { MobileLibrary } from "./mobile-library.mjs";
 import { Han1meImporter } from "./han1me-importer.mjs";
 import { YoutubeDownloader } from "./youtube-downloader.mjs";
 import { defaultDownloadFilter } from "./download-filter.mjs";
+import { normalizeStorageRepositories, applyRepositoriesToLegacyConfig } from "./storage-repositories.mjs";
+import { StorageConfigManager } from "./storage-config-manager.mjs";
+import { StorageTransferStore } from "./storage-transfer-store.mjs";
+import { classifyMediaSource } from "./media-source.mjs";
 
 const appRoot = path.resolve(import.meta.dirname, "..");
 const defaultDataRoot = "F:\\IwaraVideos\\R18\\ServiceData";
@@ -140,6 +144,7 @@ async function loadConfig() {
   }
   const missingDefault = Object.keys(defaults).some(key => !(key in current));
   let shouldWriteConfig = !Object.keys(current).length || missingDefault;
+  if (!Array.isArray(current.storageRepositories) || current.storageRepositories.length === 0) shouldWriteConfig = true;
   if (!isLoopbackHost(merged.serviceHost) && !String(merged.lanAccessToken || "").trim()) {
     merged.lanAccessToken = randomBytes(24).toString("hex");
     shouldWriteConfig = true;
@@ -172,12 +177,41 @@ async function loadConfig() {
     [...merged.externalMediaRoots, ...merged.han1meHistoryRoots]
       .map(root => [root.toLocaleLowerCase("en-US"), root])
   ).values()];
+  const explicitRepositories = Array.isArray(merged.storageRepositories) && merged.storageRepositories.length > 0;
+  let repositories = normalizeStorageRepositories({
+    ...merged,
+    storageRepositories: explicitRepositories
+      ? merged.storageRepositories.map(repository => ({ ...repository, path: path.resolve(appRoot, String(repository.path || "")) }))
+      : undefined
+  });
+  const envPrimary = envValue("IWARA_DOWNLOAD_ROOT");
+  const envFallback = envValue("IWARA_FALLBACK_DOWNLOAD_ROOT");
+  if (envPrimary || envFallback) {
+    repositories = repositories.map(repository => repository.id === "iwara-primary" && envPrimary
+      ? { ...repository, path: path.resolve(appRoot, envPrimary) }
+      : repository.id === "iwara-fallback" && envFallback
+        ? { ...repository, path: path.resolve(appRoot, envFallback) }
+        : repository);
+  }
+  merged.storageRepositories = repositories;
+  merged.storageRepositoriesVersion = 1;
+  Object.assign(merged, applyRepositoriesToLegacyConfig(merged, repositories));
   merged.enginePath = path.resolve(appRoot, String(merged.enginePath || defaultEngine));
   await mkdir(merged.dataRoot, { recursive: true });
   await mkdir(path.dirname(configPath), { recursive: true });
   if (shouldWriteConfig) {
-    await writeFile(configPath, JSON.stringify(merged, null, 2), "utf8");
+    const temporary = `${configPath}.${process.pid}.${Date.now()}.tmp`;
+    try {
+      try { await copyFile(configPath, `${configPath}.previous`); }
+      catch (error) { if (error.code !== "ENOENT") throw error; }
+      await writeFile(temporary, JSON.stringify(merged, null, 2), { encoding: "utf8", flag: "wx" });
+      await rename(temporary, configPath);
+    } catch (error) {
+      await rm(temporary, { force: true }).catch(() => {});
+      throw error;
+    }
   }
+  Object.defineProperty(merged, "configPath", { value: configPath, enumerable: false });
   return merged;
 }
 
@@ -235,9 +269,27 @@ async function main() {
     backupRoot: path.join(dataRoot, "backups")
   });
   await store.load();
+  const storageConfig = new StorageConfigManager({ config, configPath: config.configPath });
+  const storageTransferStore = new StorageTransferStore(store.db);
+  const recordMediaHistory = task => {
+    if (task?.state !== "completed") return;
+    const source = classifyMediaSource(task);
+    const rawId = String(task.videoId || "");
+    const sourceId = source === "han1" ? rawId.replace(/^han1meview-/i, "") : rawId;
+    if (["iwara", "han1"].includes(source) && sourceId) {
+      storageTransferStore.recordHistory(source, sourceId, {
+        taskId: task.id,
+        metadata: { title: task.title || "", author: task.alias || task.author || "" }
+      });
+    }
+  };
+  for (const task of store.state.tasks) {
+    recordMediaHistory(task);
+  }
   store.fileIdentity = new LocalFileIdentity({ store, root: config.downloadRoot });
   const mobileLibrary = new MobileLibrary({ store, root: config.downloadRoot, additionalRoots: config.externalMediaRoots, exportRoot: path.join(dataRoot, 'mobile-exports'), externalProgressFile: path.join(dataRoot, 'mobile-fingerprint-progress.json') });
   const importSummary = await store.importExistingFiles(config.downloadRoot, { deferLocal: true });
+  for (const task of store.state.tasks) recordMediaHistory(task);
   const ffmpeg = new FfmpegDownloader({ configuredPath: config.ffmpegPath || "" });
   const youtubeDownloader = new YoutubeDownloader({
     downloadRoot: config.downloadRoot,
@@ -262,7 +314,7 @@ async function main() {
     store,
     aria2,
     ffmpeg,
-    onCompleted: task => mobileLibrary.enqueueDownload(task),
+    onCompleted: task => { recordMediaHistory(task); return mobileLibrary.enqueueDownload(task); },
     config: {
       ...config,
       stagingRoot: path.join(dataRoot, "staging")
@@ -275,7 +327,7 @@ async function main() {
     root: config.han1meDownloadRoot,
     roots: config.han1meHistoryRoots,
     downloadFilter: config.downloadFilter,
-    onImported: () => { scheduler.mediaIndex = null; }
+    onImported: task => { scheduler.mediaIndex = null; recordMediaHistory(task); }
   });
   mobileLibrary.resumeDownloads();
   store.fileIdentity.onPathsChanged = () => { scheduler.mediaIndex = null; };
@@ -307,6 +359,8 @@ async function main() {
     transcodeCache,
     mobileLibrary,
     han1meImporter,
+    storageConfig,
+    storageTransferStore,
     youtubeDownloader,
     onShutdown: shutdown
   });

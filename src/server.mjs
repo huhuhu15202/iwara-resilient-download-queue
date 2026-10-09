@@ -1,7 +1,7 @@
 import http from "node:http";
 import { createReadStream } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
-import { randomBytes, randomInt, timingSafeEqual } from "node:crypto";
+import { readFile, realpath, stat } from "node:fs/promises";
+import { createHash, randomBytes, randomInt, randomUUID, timingSafeEqual } from "node:crypto";
 import { networkInterfaces } from "node:os";
 import path from "node:path";
 import { CoverCache } from "./cover-cache.mjs";
@@ -12,6 +12,7 @@ import { playbackExperienceScript } from "./playback-experience-ui.mjs";
 import { YoutubeDownloader } from "./youtube-downloader.mjs";
 import { receiveHan1meArchive } from "./han1me-archive.mjs";
 import { classifyMediaSource } from "./media-source.mjs";
+import { repositoryOwnsPath } from "./storage-repositories.mjs";
 
 const SERVICE_VERSION = "1.16.1";
 
@@ -259,6 +260,15 @@ function zip64Extra(...values) {
   return extra;
 }
 
+async function sha256File(filePath) {
+  const digest = createHash("sha256");
+  const before = await stat(filePath);
+  for await (const chunk of createReadStream(filePath)) digest.update(chunk);
+  const after = await stat(filePath);
+  if (before.size !== after.size || before.mtimeMs !== after.mtimeMs) throw new Error("文件在指纹核对期间发生变化");
+  return { size: after.size, mtimeMs: after.mtimeMs, sha256: digest.digest("hex") };
+}
+
 function storedZipContentLength(files) {
   let length = 98; // ZIP64 EOCD, locator, and classic EOCD records.
   for (const file of files) {
@@ -425,7 +435,7 @@ td.completed{color:#25835a;font-weight:700}td.failed{color:#c74444;font-weight:7
 .present{color:#25835a}.missing,.size_mismatch{color:#c74444}.progress{height:8px;background:#e7eef7;border-radius:8px;overflow:hidden;margin-top:8px}.progress i{display:block;height:100%;background:linear-gradient(90deg,#5b8def,#6bb7ee)}
 .actions{display:flex;gap:6px;flex-wrap:wrap}.actions a{text-decoration:none}.actions button{padding:6px 9px;min-height:32px;font-size:12px}.quick-actions{display:inline-flex;gap:7px;align-items:center;flex-wrap:wrap;vertical-align:middle;margin-left:6px}.quick-actions a{text-decoration:none}.lan-links{display:inline-flex;gap:6px;flex-wrap:wrap;vertical-align:middle;margin-left:6px}.lan-links button{padding:5px 9px;min-height:30px;font-size:12px}.lan-links a{padding:5px 9px;border:1px solid #cbd7e6;border-radius:9px;background:#fff;color:#33445c;text-decoration:none;font-size:12px;font-weight:600}.lan-links a:hover{border-color:#5b8def;background:#eef5ff}
 .pager{display:flex;justify-content:space-between;gap:14px;align-items:center;margin-top:14px;background:#fff;border:1px solid #dfe7f1;border-radius:12px;padding:12px 14px}.pager>span:last-child{display:flex;gap:7px;flex-wrap:wrap}.empty{text-align:center;color:#7a899d;padding:34px}
-.modal-backdrop{position:fixed;inset:0;z-index:20;background:rgba(35,50,71,.35);display:none;align-items:center;justify-content:center;padding:18px}.modal-backdrop.open{display:flex}.modal{width:min(980px,100%);max-height:90vh;overflow:auto;background:#f8fbff;border-radius:18px;padding:20px;box-shadow:0 24px 70px rgba(29,52,84,.3)}.modal h2{margin:0 0 5px;color:#17365f}.modal-tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:14px 0}.modal-tools input{min-width:240px;flex:1}.author-grid{display:grid;gap:8px}.author-row{display:grid;grid-template-columns:32px minmax(190px,1fr) 110px 125px minmax(210px,1.2fr);gap:9px;align-items:center;background:#fff;border:1px solid #dfe7f1;border-radius:11px;padding:9px 11px}.author-row input[type=checkbox]{min-height:auto;width:18px;height:18px}.author-row input[type=text]{width:100%}.modal-actions{position:sticky;bottom:-20px;display:flex;justify-content:flex-end;gap:8px;background:#f8fbff;padding:14px 0 0}.preview{white-space:pre-wrap;background:#eef5ff;border-radius:10px;padding:11px 13px;color:#36516f;margin-top:12px}
+.modal-backdrop{position:fixed;inset:0;z-index:20;background:rgba(35,50,71,.35);display:none;align-items:center;justify-content:center;padding:18px}.modal-backdrop.open{display:flex}.modal{width:min(980px,100%);max-height:90vh;overflow:auto;background:#f8fbff;border-radius:18px;padding:20px;box-shadow:0 24px 70px rgba(29,52,84,.3)}.modal h2{margin:0 0 5px;color:#17365f}.modal-tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:14px 0}.modal-tools input{min-width:240px;flex:1}.author-grid{display:grid;gap:8px}.author-row{display:grid;grid-template-columns:32px minmax(190px,1fr) 110px 125px minmax(210px,1.2fr);gap:9px;align-items:center;background:#fff;border:1px solid #dfe7f1;border-radius:11px;padding:9px 11px}.author-row input[type=checkbox]{min-height:auto;width:18px;height:18px}.author-row input[type=text]{width:100%}.modal-actions{position:sticky;bottom:-20px;display:flex;justify-content:flex-end;gap:8px;background:#f8fbff;padding:14px 0 0}.preview{white-space:pre-wrap;background:#eef5ff;border-radius:10px;padding:11px 13px;color:#36516f;margin-top:12px}.repo-list{display:grid;gap:10px;margin:14px 0}.repo-card{background:#fff;border:1px solid #dbe5f0;border-radius:13px;padding:13px}.repo-card-head{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:10px}.repo-card-head b{color:#254667}.repo-fields{display:grid;grid-template-columns:1fr 1fr 1.3fr;gap:9px}.repo-fields label{display:grid;gap:4px;color:#6d7d91;font-size:12px}.repo-fields label.path-field{grid-column:1/-1}.repo-fields input,.repo-fields select{width:100%;min-width:0}.repo-flags{display:flex;gap:13px;flex-wrap:wrap;align-items:center;margin-top:10px;color:#53657b}.repo-flags label{display:inline-flex;gap:5px;align-items:center;font-size:12px}.repo-flags input{min-height:auto;width:16px;height:16px}.repo-empty{padding:24px;text-align:center;color:#71829a;border:1px dashed #cbd7e6;border-radius:12px}
 .control-panel-backdrop{position:fixed;inset:0;z-index:15;background:rgba(35,50,71,.22);display:none;align-items:flex-start;justify-content:flex-end;padding:18px}.control-panel-backdrop.open{display:flex}.control-panel{width:min(520px,calc(100vw - 28px));max-height:calc(100vh - 36px);overflow:auto;background:#f8fbff;border:1px solid #d8e5f2;border-radius:18px;padding:20px;box-shadow:0 24px 70px rgba(29,52,84,.3)}.control-panel h2{margin:0;color:#17365f}.control-panel p{margin:5px 0 14px;color:#63738a}.control-panel-tools{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.control-panel-tools button,.control-panel-tools a{width:100%}.control-panel-tools a button{width:100%}.retry-category-tools{grid-column:1/-1;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;min-width:0}.retry-category-tools select{width:100%;min-width:0}.retry-category-tools button{width:auto!important}.control-panel-foot{display:flex;justify-content:flex-end;margin-top:14px}.control-panel .lan-links{display:flex;margin:12px 0 0}
 @media(max-width:900px){main{padding:14px}.filters{grid-template-columns:1fr 1fr}.filters input{grid-column:1/-1}.pager{align-items:flex-start;flex-direction:column}h1{font-size:23px}}
 @media(max-width:700px){.author-row{grid-template-columns:28px 1fr}.author-row>*:nth-child(n+3){grid-column:2}.filters{grid-template-columns:1fr}.cards{grid-template-columns:1fr 1fr}}
@@ -450,6 +460,7 @@ td.completed{color:#25835a;font-weight:700}td.failed{color:#c74444;font-weight:7
   <p>常用管理、补齐和服务操作集中在这里；列表主界面仅保留筛选与翻页。</p>
   <div class="control-panel-tools">
     <a href="/IwaraResilientQueue.user.js"><button>安装 / 更新网页脚本</button></a>
+    <button onclick="openStorageRepositories()">电脑仓库设置</button>
     <button onclick="openAuthorClassification()">按作者整理视频</button>
     <button onclick="queueViews()">同步缺失播放量</button>
     <button onclick="refreshAllViews()">更新全部播放量</button>
@@ -461,6 +472,7 @@ td.completed{color:#25835a;font-weight:700}td.failed{color:#c74444;font-weight:7
   </div>
   <div class="control-panel-foot"><button onclick="closeControlPanel()">关闭控制面板</button></div>
 </section></div>
+<div id="storageRepositoryModal" class="modal-backdrop" onclick="if(event.target===this)closeStorageRepositories()"><section class="modal" style="width:min(1040px,100%)"><h2>电脑仓库设置</h2><p>仓库真实路径只在这台电脑显示。接收/下载仓库必须同时启用扫描和媒体提供。保存不会移动文件；新配置待生效，服务空闲后按原启动流程重启。</p><div id="storageRepositoryNotice" class="preview">读取仓库配置中…</div><div class="modal-tools"><button onclick="addStorageRepository()">添加仓库</button></div><div id="storageRepositoryRows" class="repo-list"></div><div class="modal-actions"><button onclick="closeStorageRepositories()">取消</button><button onclick="validateStorageRepositories()">验证目录</button><button onclick="saveStorageRepositories()">保存配置</button></div></section></div>
 <div id="authorModal" class="modal-backdrop" onclick="if(event.target===this)closeAuthorClassification()"><section class="modal">
   <h2>按作者整理已下载视频</h2>
   <div class="hint">只显示已完成视频超过 10 个的作者。勾选作者并填写分类目录；多个作者使用相同目录名，就会合并到同一个目录。先预览，确认后才移动当前根目录中的视频；以后新下载也自动归类。</div>
@@ -473,6 +485,15 @@ td.completed{color:#25835a;font-weight:700}td.failed{color:#c74444;font-weight:7
 ${authBootstrapScript()}
 const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 async function loadQuickLanLinks(){const target=el('quickLanLinks');if(!target)return;target.replaceChildren();try{const r=await fetch('/api/lan-info',{cache:'no-store'}),data=await r.json();if(!r.ok)throw Error(data.error||r.status);const local=(data.urls||[]).find(url=>url.includes('://10.')||url.includes('://192.168.'))||(data.urls||[])[0];const remote=(data.remoteUrls||[])[0];const tailscaleOnline=Boolean(data.tailscale?.online);const entries=[local?{url:local,label:'局域网原画 · 复制'}:null,remote?{url:remote,label:'远程480p · 复制'}:null].filter(Boolean);if(!entries.length)target.textContent=data.enabled?'未发现可用播放地址':'局域网播放未开启';entries.forEach(({url,label})=>{const copy=document.createElement('button');copy.type='button';copy.title='点击复制完整播放地址：'+url;copy.textContent=label;copy.onclick=async()=>{const original=label;try{if(navigator.clipboard?.writeText)await navigator.clipboard.writeText(url);else{const area=document.createElement('textarea');area.value=url;area.style.position='fixed';area.style.opacity='0';document.body.append(area);area.focus();area.select();if(!document.execCommand('copy'))throw Error('copy failed');area.remove()}copy.textContent='已复制';setTimeout(()=>copy.textContent=original,1600)}catch{copy.textContent='复制失败';setTimeout(()=>copy.textContent=original,1600)}};target.append(copy)});const state=document.createElement('span');state.className='tailscale-state';state.textContent='Tailscale '+(tailscaleOnline?'在线':'离线');target.append(state);}catch(error){target.textContent='播放链接读取失败';target.title=error.message}}
+let storageRepositoryRevision='',storageRepositories=[];
+function closeStorageRepositories(){el('storageRepositoryModal').classList.remove('open')}
+function renderStorageRepositories(){const host=el('storageRepositoryRows');if(!storageRepositories.length){host.innerHTML='<div class="repo-empty">尚未配置仓库。添加目录后可按来源和用途分配。</div>';return}host.innerHTML=storageRepositories.map((repository,index)=>{const roles=[['download','新下载落盘'],['receive','接收手机归档'],['scan','扫描入账'],['serve','在线播放/发送到手机']];const roleHtml=roles.map(([role,label])=>'<label><input type="checkbox" data-repo-index="'+index+'" data-repo-role="'+role+'" '+(repository.roles.includes(role)?'checked':'')+'> '+label+'</label>').join('');return '<article class="repo-card" data-repo-card="'+index+'"><div class="repo-card-head"><b>仓库 '+(index+1)+' · '+esc(repository.name||repository.id||'未命名')+'</b><button type="button" onclick="removeStorageRepository('+index+')">移除</button></div><div class="repo-fields"><label>稳定 ID<input data-repo-field="id" value="'+esc(repository.id||'')+'" maxlength="64"></label><label>显示名称<input data-repo-field="name" value="'+esc(repository.name||'')+'" maxlength="100"></label><label>媒体来源<select data-repo-field="source"><option value="iwara" '+(repository.source==='iwara'?'selected':'')+'>Iwara</option><option value="han1" '+(repository.source==='han1'?'selected':'')+'>Han1</option><option value="other" '+(repository.source==='other'?'selected':'')+'>其他</option></select></label><label class="path-field">电脑目录路径<input data-repo-field="path" value="'+esc(repository.path||'')+'" placeholder="例如 F:\\Video\\Han" spellcheck="false"></label><label>优先级（数值越小越优先）<input data-repo-field="priority" type="number" min="0" step="1" value="'+Number(repository.priority||0)+'"></label><label>最低保留空间（GiB）<input data-repo-field="minimumFreeGiB" type="number" min="0" step="0.5" value="'+(Number(repository.minimumFreeBytes||0)/1073741824)+'"></label></div><div class="repo-flags"><label><input type="checkbox" data-repo-field="enabled" '+(repository.enabled?'checked':'')+'> 启用仓库</label>'+roleHtml+'</div></article>'}).join('')}
+function addStorageRepository(){storageRepositories.push({id:'new-repository-'+(storageRepositories.length+1),name:'新媒体仓库',path:'',source:'iwara',enabled:true,roles:['scan','serve'],priority:storageRepositories.length*10,minimumFreeBytes:0});renderStorageRepositories()}
+function removeStorageRepository(index){if(!confirm('仅从配置中移除/停用该仓库？不会删除目录、文件或台账记录。'))return;storageRepositories.splice(index,1);renderStorageRepositories()}
+function storageRepositoryValue(){return [...el('storageRepositoryRows').querySelectorAll('[data-repo-card]')].map(card=>{const value=key=>card.querySelector('[data-repo-field="'+key+'"]');const roles=[...card.querySelectorAll('[data-repo-role]:checked')].map(box=>box.dataset.repoRole);return {id:value('id').value.trim(),name:value('name').value.trim(),path:value('path').value.trim(),source:value('source').value,enabled:value('enabled').checked,roles,priority:Number(value('priority').value),minimumFreeBytes:Math.round(Number(value('minimumFreeGiB').value)*1073741824)}})}
+async function openStorageRepositories(){closeControlPanel();el('storageRepositoryModal').classList.add('open');const notice=el('storageRepositoryNotice');notice.textContent='读取配置中…';try{const r=await fetch('/api/storage/repositories',{cache:'no-store'}),data=await r.json();if(!r.ok)throw Error(data.error||r.status);storageRepositoryRevision=data.revision;storageRepositories=data.repositories||[];renderStorageRepositories();notice.textContent=(data.pendingRestart?'当前有待生效配置。':'当前配置已生效。')+(data.environmentLocks?.length?' 环境变量覆盖：'+data.environmentLocks.map(x=>x.variable).join('、')+'；受覆盖项目只读。':'')}catch(e){notice.textContent='无法读取：'+e.message}}
+async function validateStorageRepositories(){const notice=el('storageRepositoryNotice');try{notice.textContent='正在验证路径和读写权限…';const r=await fetch('/api/storage/repositories/validate',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({repositories:storageRepositoryValue()})});const data=await r.json();if(!r.ok)throw Error(data.error||r.status);notice.textContent='目录验证通过：'+data.repositories.length+' 个仓库。未移动或扫描任何文件。'}catch(e){notice.textContent='验证未通过：'+e.message}}
+async function saveStorageRepositories(){const notice=el('storageRepositoryNotice');try{notice.textContent='正在安全保存…';const r=await fetch('/api/storage/repositories',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify({repositories:storageRepositoryValue(),revision:storageRepositoryRevision})});const data=await r.json();if(!r.ok)throw Error(data.error||r.status);storageRepositoryRevision=data.revision;storageRepositories=data.repositories||[];renderStorageRepositories();notice.textContent='已安全保存；这是待生效配置。当前任务不受影响，服务空闲后按原启动流程重启即可。'}catch(e){notice.textContent='保存失败：'+e.message}}
 const stateNames={queued:'等待中',resolving:'解析中',downloading:'下载中',finalizing:'文件入库',completed:'已完成',failed:'已失败',filtered:'过滤拦截'};
 const fileNames={present:'正常',missing:'文件缺失',size_mismatch:'大小异常',unknown:'未检查'};
 const errorNames={tls_certificate:'CDN 证书或主机名不匹配',tls_handshake:'TLS 握手失败',source_exhausted:'可用 CDN 均已尝试',not_found:'旧记录：资源未找到（未确认视频删除）',access_or_expired:'旧记录：地址过期或拒绝访问',video_missing:'视频资料接口确认不存在',permission_denied:'当前账号没有视频访问权限',cdn_not_found:'CDN 链接失效，需重新解析',link_expired:'签名链接过期或被 CDN 拒绝',rate_limited:'请求过于频繁',invalid_media:'CDN 返回空文件或错误页',timeout:'下载超时',network:'网络连接失败',permission:'权限不足',source_unavailable:'没有可用视频源',download_filtered:'命中永久下载过滤名单',unknown:'其他错误'};
@@ -1134,12 +1155,90 @@ async function serveLocalCover(request, response, scheduler, cache, encodedId) {
   }
 }
 
-export function createServer({ scheduler, host, port, accessToken = "", ffmpeg = null, transcodeCache = null, mobileLibrary = null, han1meImporter = null, youtubeDownloader = null, onShutdown }) {
+export function createServer({ scheduler, host, port, accessToken = "", ffmpeg = null, transcodeCache = null, mobileLibrary = null, han1meImporter = null, storageConfig = null, storageTransferStore = null, youtubeDownloader = null, onShutdown }) {
   const coverCache = new CoverCache({ ffmpeg });
   const mediaDiagnostics = [];
   const presenceClients = new Map();
   const batchDownloadJobs = new Map();
   const presenceTimeoutMs = 30_000;
+  const sourceIdOf = task => classifyMediaSource(task) === "han1"
+    ? String(task.videoId || "").replace(/^han1meview-/i, "")
+    : String(task.videoId || "");
+  const pathIsWithin = (root, candidate) => {
+    const relative = path.relative(root, candidate);
+    return relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+  };
+  const refreshInventory = async requested => {
+    if (!storageTransferStore || !Array.isArray(requested)) return;
+    const tasks = scheduler.store?.state?.tasks || [];
+    for (const item of requested) {
+      const repositories = (scheduler.config.storageRepositories || []).filter(repository => repository.enabled &&
+        repository.source === item.source && repository.roles.includes("scan") && repository.roles.includes("serve") &&
+        (!item.repositoryId || repository.id === item.repositoryId));
+      if (item.source === "han1") {
+        const relativePath = String(item.relativePath || "");
+        const parts = relativePath.split("/");
+        if (!relativePath || relativePath.includes("\\") || parts.some(part => !part || part === "." || part === "..") || parts[0] !== item.sourceId) continue;
+        const indexedTask = tasks.find(task => classifyMediaSource(task) === "han1" &&
+          (sourceIdOf(task) === item.sourceId || String(task.han1meId || "") === item.sourceId) && task.state === "completed");
+        if (!indexedTask) continue;
+        for (const repository of repositories) {
+          try {
+            const root = await realpath(repository.path);
+            const candidate = path.resolve(root, ...parts);
+            if (!pathIsWithin(root, candidate)) continue;
+            const actualPath = await realpath(candidate);
+            if (!pathIsWithin(root, actualPath)) continue;
+            const fingerprint = await sha256File(actualPath);
+            if (fingerprint.size !== Number(item.size) || fingerprint.sha256 !== item.sha256) continue;
+            storageTransferStore.upsertInventory({ source: item.source, sourceId: item.sourceId,
+              taskId: String(item.taskId || indexedTask.id), role: item.role || "media", repositoryId: repository.id,
+              relativePath: parts.join("/"), filename: path.basename(actualPath), size: fingerprint.size,
+              sha256: fingerprint.sha256, quality: "", metadata: {
+                title: indexedTask.title || "", author: indexedTask.alias || indexedTask.author || "",
+                uploadTime: indexedTask.uploadTime || null, views: indexedTask.views ?? indexedTask.viewCount ?? null,
+                tags: indexedTask.tags || []
+              } });
+            break;
+          } catch { /* Unavailable or changed files remain unconfirmed. */ }
+        }
+        continue;
+      }
+
+      // A source ID can legitimately have several quality/task rows. Prefer the frozen task ID,
+      // otherwise inspect all matching rows instead of letting the last one mask the others.
+      const candidates = tasks.filter(task => classifyMediaSource(task) === item.source &&
+        sourceIdOf(task) === item.sourceId && task.destination && (!item.taskId || task.id === item.taskId));
+      for (const task of candidates) {
+        let identity;
+        try { identity = scheduler.store.db.prepare("SELECT * FROM mobile_media_identity WHERE task_id=?").get(task.id); }
+        catch { continue; }
+        if (!identity || identity.size !== Number(item.size) || identity.sha256 !== item.sha256) continue;
+        let info;
+        try { info = await stat(identity.path); } catch { continue; }
+        if (!info.isFile() || info.size !== identity.size || info.mtimeMs !== identity.mtime_ms) continue;
+        const owner = repositoryOwnsPath(repositories, identity.path, "scan");
+        if (!owner || owner.source !== item.source || !owner.roles.includes("serve")) continue;
+        const relativePath = path.relative(owner.path, identity.path).split(path.sep).join("/");
+        storageTransferStore.upsertInventory({ source: item.source, sourceId: item.sourceId, taskId: task.id,
+          role: item.role || "media", repositoryId: owner.id, relativePath, filename: path.basename(identity.path),
+          size: identity.size, sha256: identity.sha256, quality: String(task.quality || task.resolution || ""), metadata: {
+            title: task.title || "", author: task.alias || task.author || "", uploadTime: task.uploadTime || null,
+            views: task.views ?? task.viewCount ?? null, tags: task.tags || []
+          } });
+        break;
+      }
+    }
+  };
+  const repositoryAvailability = async source => {
+    const repositories = scheduler.config.storageRepositories || [];
+    const targets = repositories.filter(item => item.enabled && item.source === source && item.roles.includes("scan"));
+    const results = await Promise.all(targets.map(async item => {
+      try { const info = await stat(item.path); return { id: item.id, available: info.isDirectory() }; }
+      catch { return { id: item.id, available: false }; }
+    }));
+    return { complete: results.length > 0 && results.every(item => item.available), results };
+  };
   scheduler.setWebPresence?.(false, 0);
   const presenceTimer = setInterval(() => {
     const cutoff = Date.now() - presenceTimeoutMs;
@@ -1179,11 +1278,16 @@ export function createServer({ scheduler, host, port, accessToken = "", ffmpeg =
       }
       allowedRoots.push({ path: resolved, archivePrefix });
     };
-    addAllowedRoot(scheduler.config?.downloadRoot, true);
-    for (const mediaRoot of Array.isArray(scheduler.config?.externalMediaRoots) ? scheduler.config.externalMediaRoots : []) {
-      addAllowedRoot(mediaRoot);
+    const configuredMediaRoots = (scheduler.config?.storageRepositories || [])
+      .filter(item => item.enabled && item.roles.includes("serve"))
+      .sort((left, right) => right.path.length - left.path.length || left.priority - right.priority);
+    if (configuredMediaRoots.length) {
+      for (const repository of configuredMediaRoots) addAllowedRoot(repository.path, repository.path === scheduler.config?.downloadRoot);
+    } else {
+      addAllowedRoot(scheduler.config?.downloadRoot, true);
+      for (const mediaRoot of Array.isArray(scheduler.config?.externalMediaRoots) ? scheduler.config.externalMediaRoots : []) addAllowedRoot(mediaRoot);
+      addAllowedRoot(scheduler.config?.han1meDownloadRoot);
     }
-    addAllowedRoot(scheduler.config?.han1meDownloadRoot);
     if (!allowedRoots.length) throw new Error("服务未配置媒体目录，无法安全打包");
     const files = [];
     const missing = [];
@@ -1204,6 +1308,15 @@ export function createServer({ scheduler, host, port, accessToken = "", ffmpeg =
       catch { missing.push(taskId); continue; }
       if (!info.isFile()) { missing.push(taskId); continue; }
       const mobileInfo = mobilePackage?.videosByTaskId?.get(taskId);
+      if (mobilePackage?.protocolVersion === 2) {
+        const priorIdentity = scheduler.store.db.prepare("SELECT * FROM mobile_media_identity WHERE task_id=?").get(taskId);
+        let fingerprint = priorIdentity && priorIdentity.path === filePath && priorIdentity.size === info.size && priorIdentity.mtime_ms === info.mtimeMs
+          ? { size: priorIdentity.size, mtimeMs: priorIdentity.mtime_ms, sha256: priorIdentity.sha256 }
+          : await sha256File(filePath);
+        if (fingerprint.size !== info.size || fingerprint.mtimeMs !== info.mtimeMs) throw new Error(`文件在打包时发生变化：${path.basename(filePath)}`);
+        if (mobileInfo && mobileInfo.sha256 && mobileInfo.sha256 !== fingerprint.sha256) throw new Error(`文件指纹与已保存资料不符：${path.basename(filePath)}`);
+        if (mobileInfo) mobileInfo.sha256 = fingerprint.sha256;
+      }
       const safeName = path.basename(media.name || filePath).replace(/[\\/\u0000-\u001f]/g, "_").replace(/^\.+/, "").slice(0, 150) || "video.mp4";
       files.push({
         path: filePath,
@@ -1226,11 +1339,17 @@ export function createServer({ scheduler, host, port, accessToken = "", ffmpeg =
     const totalBytes = files.reduce((total, file) => total + file.size, 0);
     if (!Number.isSafeInteger(totalBytes)) throw new Error("所选文件总大小超出安全范围，请减少选择数量");
     if (mobilePackage) {
+      const manifestVideos = files.map(file => ({ ...mobilePackage.videosByTaskId.get(file.taskId),
+        sourceId: mobilePackage.videosByTaskId.get(file.taskId)?.sourceId || mobilePackage.videosByTaskId.get(file.taskId)?.videoId || "",
+        name: path.basename(file.path), size: file.size, entryName: file.archiveName }));
       const manifest = {
         type: "iwara-mobile-random-batch",
-        version: 1,
+        version: mobilePackage.protocolVersion === 2 ? 2 : 1,
         source: mobilePackage.source,
-        videos: files.map(file => ({ ...mobilePackage.videosByTaskId.get(file.taskId), name: path.basename(file.path), size: file.size, entryName: file.archiveName }))
+        transferId: mobilePackage.transferId || "",
+        videos: manifestVideos,
+        ...(mobilePackage.protocolVersion === 2 ? { files: manifestVideos.map(video => ({ source: video.source, sourceId: video.sourceId,
+          taskId: video.taskId, role: "media", path: video.entryName, size: video.size, sha256: video.sha256 })) } : {})
       };
       const manifestBytes = Buffer.from(JSON.stringify(manifest), "utf8");
       files.unshift({ archiveName: "manifest.json", data: manifestBytes, size: manifestBytes.length, mtimeMs: Date.now() });
@@ -1267,6 +1386,15 @@ export function createServer({ scheduler, host, port, accessToken = "", ffmpeg =
   };
   const prepareMobileRandomDownload = async body => {
     if (!mobileLibrary) throw Object.assign(new Error("手机资料同步尚未启用"), { statusCode: 503 });
+    const protocolVersion = Number(body.protocolVersion) === 2 ? 2 : 1;
+    const requestKey = String(body.requestKey || "").trim().slice(0, 160);
+    if (protocolVersion === 2 && !storageTransferStore) throw Object.assign(new Error("持久传输任务存储尚未启用"), { statusCode: 503 });
+    if (protocolVersion === 2 && requestKey) {
+      const prior = storageTransferStore.getTransferByRequestKey(requestKey);
+      if (prior) return { ...prior.payload, transferId: prior.id,
+        batches: prior.batches.map(batch => ({ ...batch.payload, batchId: batch.id, state: batch.state })) };
+    }
+    const transferId = protocolVersion === 2 ? randomUUID() : "";
     const source = ["all", "iwara", "han1"].includes(body.source) ? body.source : "all";
     const requested = Number(body.count ?? 20);
     if (!Number.isInteger(requested) || requested < 1 || requested > 100) {
@@ -1285,6 +1413,7 @@ export function createServer({ scheduler, host, port, accessToken = "", ffmpeg =
       [candidates[index], candidates[other]] = [candidates[other], candidates[index]];
     }
     const batchLimit = 4_500_000_000;
+    const batchTarget = protocolVersion === 2 ? 1024 ** 3 : batchLimit;
     const selected = [];
     let oversizeSkipped = 0;
     let unavailableSkipped = 0;
@@ -1298,6 +1427,15 @@ export function createServer({ scheduler, host, port, accessToken = "", ffmpeg =
       catch { unavailableSkipped += 1; continue; }
       if (!info.isFile() || info.size <= 0) { unavailableSkipped += 1; continue; }
       if (info.size > batchLimit) { oversizeSkipped += 1; continue; }
+      let sha256 = "";
+      if (protocolVersion === 2) {
+        const identity = scheduler.store.db.prepare("SELECT * FROM mobile_media_identity WHERE task_id=?").get(task.id);
+        if (identity && identity.path === path.resolve(media.path) && identity.size === info.size && identity.mtime_ms === info.mtimeMs) sha256 = identity.sha256;
+        else {
+          try { const fingerprint = await sha256File(media.path); if (fingerprint.size !== info.size || fingerprint.mtimeMs !== info.mtimeMs) throw new Error("file changed"); sha256 = fingerprint.sha256; }
+          catch { unavailableSkipped += 1; continue; }
+        }
+      }
       const viewCount = task.viewCount ?? task.views;
       const uploadTimeValue = task.uploadTime;
       const uploadTimeParsed = typeof uploadTimeValue === "number"
@@ -1311,6 +1449,8 @@ export function createServer({ scheduler, host, port, accessToken = "", ffmpeg =
           taskId: String(task.id),
           videoId: String(task.videoId || "").slice(0, 256),
           source: classifyMediaSource(task),
+          sourceId: sourceIdOf(task),
+          ...(protocolVersion === 2 ? { sha256 } : {}),
           title: String(task.title || "").slice(0, 512),
           author: String(task.alias || task.author || "").slice(0, 256),
           uploadTime: Number.isFinite(uploadTimeParsed) ? uploadTimeParsed : null,
@@ -1320,28 +1460,54 @@ export function createServer({ scheduler, host, port, accessToken = "", ffmpeg =
         }
       });
     }
-    const groups = partitionMobileDownloadBatches(selected, batchLimit);
+    const groups = [];
+    let group = { items: [], totalBytes: 0 };
+    for (const item of selected) {
+      if (group.items.length && group.totalBytes + item.size > batchTarget) { groups.push(group); group = { items: [], totalBytes: 0 }; }
+      group.items.push(item); group.totalBytes += item.size;
+    }
+    if (group.items.length) groups.push(group);
     const batches = [];
     try {
       for (const current of groups) {
         const videosByTaskId = new Map(current.items.map(item => [item.id, item.video]));
-        const prepared = await prepareBatchDownload(current.items.map(item => item.id), "", { source, videosByTaskId });
-        batches.push({ ...prepared, totalBytes: current.totalBytes });
+        const batchId = protocolVersion === 2 ? randomUUID() : "";
+        const prepared = await prepareBatchDownload(current.items.map(item => item.id), "", { source, videosByTaskId, protocolVersion, transferId });
+        batches.push({ ...prepared, totalBytes: current.totalBytes, batchId,
+          taskIds: current.items.map(item => item.id), videosByTaskId: Object.fromEntries(videosByTaskId) });
       }
     } catch (error) {
       for (const batch of batches) batchDownloadJobs.delete(batch.downloadId);
       throw error;
     }
-    return {
+    const result = {
       source,
       requestedCount: requested,
       selectedCount: selected.length,
       alreadyPresentCount: excluded.size,
       oversizeSkipped,
       unavailableSkipped,
-      batchLimitBytes: batchLimit,
+      batchLimitBytes: batchTarget,
       batches
     };
+    if (protocolVersion === 2) {
+      const transferBatches = groups.map((group, index) => {
+        const prepared = batches[index];
+        return { id: prepared.batchId, batchNo: index + 1, totalBytes: group.totalBytes,
+          payload: { url: prepared.url, downloadId: prepared.downloadId, archiveName: prepared.archiveName,
+            archiveBytes: prepared.archiveBytes, expiresInSeconds: prepared.expiresInSeconds,
+            taskIds: prepared.taskIds, source, videosByTaskId: prepared.videosByTaskId },
+          files: group.items.map(item => ({ source: item.video.source, sourceId: item.video.sourceId,
+            taskId: item.id, role: "media", relativePath: item.video.entryName || item.video.videoId,
+            size: item.size, sha256: item.video.sha256 })) };
+      });
+      const transfer = storageTransferStore.createTransfer({ id: transferId, direction: "download", source,
+        configVersion: "", requestKey, payload: { source, requestedCount: requested, selectedCount: selected.length,
+          alreadyPresentCount: excluded.size, oversizeSkipped, unavailableSkipped, batchLimitBytes: batchTarget }, batches: transferBatches });
+      result.transferId = transfer.id;
+      result.batches = transfer.batches.map((batch, index) => ({ ...batches[index], batchId: batch.id, state: batch.state }));
+    }
+    return result;
   };
   const server = http.createServer(async (request, response) => {
     const origin = request.headers.origin || "";
@@ -1442,7 +1608,203 @@ export function createServer({ scheduler, host, port, accessToken = "", ffmpeg =
         response.end();
         return;
       }
-      if (request.method === "GET" && url.pathname === "/") {
+      if (["GET", "PUT"].includes(request.method) && url.pathname === "/api/storage/repositories" ||
+          request.method === "POST" && url.pathname === "/api/storage/repositories/validate") {
+        if (!isLoopbackAddress(request.socket?.remoteAddress || "")) { reply(403, { error: "仓库路径管理只允许电脑本机访问" }); return; }
+        if (!storageConfig) { reply(503, { error: "仓库配置管理尚未启用" }); return; }
+        if (request.method === "GET") reply(200, storageConfig.view());
+        else {
+          const body = await readJson(request, 1024 * 1024);
+          if (!Array.isArray(body.repositories)) { reply(400, { error: "缺少仓库数组" }); return; }
+          if (url.pathname.endsWith("/validate")) {
+            const repositories = await storageConfig.validate(body.repositories);
+            reply(200, { valid: true, repositories });
+          } else {
+            const result = await storageConfig.save(body.repositories, String(body.revision || ""));
+            reply(200, result);
+          }
+        }
+      } else if (request.method === "GET" && url.pathname === "/api/mobile/capabilities") {
+        const repositories = (scheduler.config.storageRepositories || []).filter(item => item.enabled &&
+          ["iwara", "han1"].includes(item.source) && (item.roles.includes("serve") || item.roles.includes("receive")));
+        const availability = await Promise.all(repositories.map(async item => {
+          try { return { id: item.id, available: (await stat(item.path)).isDirectory() }; }
+          catch { return { id: item.id, available: false }; }
+        }));
+        reply(200, { protocolVersions: [1, 2], preferredProtocolVersion: 2,
+          serviceId: storageTransferStore?.serviceId || "", batchTargetBytes: 1024 ** 3,
+          batchHardLimitBytes: 4_500_000_000, repositories: repositories.map(item => ({ id: item.id,
+            name: item.name, source: item.source, roles: item.roles, available: availability.find(state => state.id === item.id)?.available ?? false })) });
+      } else if (request.method === "GET" && url.pathname === "/api/mobile/download-history") {
+        if (!storageTransferStore) { reply(503, { error: "持久媒体历史尚未启用" }); return; }
+        const source = String(url.searchParams.get("source") || "");
+        if (source && !["iwara", "han1"].includes(source)) { reply(400, { error: "来源无效" }); return; }
+        reply(200, { items: storageTransferStore.listHistory(source) });
+      } else if (request.method === "POST" && url.pathname === "/api/mobile/inventory/check") {
+        if (!storageTransferStore) { reply(503, { error: "媒体库存尚未启用" }); return; }
+        const body = await readJson(request, 2 * 1024 * 1024);
+        if (!Array.isArray(body.files) || body.files.length > 5000) { reply(400, { error: "文件核对清单无效" }); return; }
+        const files = body.files.map(file => ({ source: String(file?.source || ""), sourceId: String(file?.sourceId || ""),
+          taskId: String(file?.taskId || ""), relativePath: String(file?.relativePath || ""),
+          repositoryId: String(file?.repositoryId || ""), size: Number(file?.size),
+          sha256: String(file?.sha256 || "").toLowerCase(), role: String(file?.role || "media") }));
+        if (files.some(file => !["iwara", "han1"].includes(file.source) || !file.sourceId ||
+            !Number.isSafeInteger(file.size) || file.size < 0 || !/^[a-f0-9]{64}$/.test(file.sha256))) {
+          reply(400, { error: "文件身份、长度或 SHA-256 无效" }); return;
+        }
+        await refreshInventory(files);
+        const checked = storageTransferStore.checkInventory(files);
+        const availability = new Map();
+        for (const source of new Set(files.map(file => file.source))) availability.set(source, await repositoryAvailability(source));
+        for (const item of checked) {
+          if (item.status === "missing" && !availability.get(item.source)?.complete) {
+            item.status = "unknown";
+            item.reason = "至少一个启用的扫描仓库当前不可用，不能确认文件缺失";
+          } else if (item.status === "present") {
+            const unavailableCopy = item.copies?.some(copy => availability.get(item.source)?.results.find(repo => repo.id === copy.repositoryId)?.available === false);
+            if (unavailableCopy) { item.status = "unknown"; item.reason = "文件所在仓库当前不可用"; }
+          }
+        }
+        reply(200, { checkedAt: new Date().toISOString(), complete: [...availability.values()].every(item => item.complete), files: checked });
+      } else if (request.method === "POST" && url.pathname === "/api/mobile/transfers") {
+        if (!storageTransferStore) { reply(503, { error: "传输任务存储尚未启用" }); return; }
+        const body = await readJson(request, 4 * 1024 * 1024);
+        const direction = String(body.direction || ""); const source = String(body.source || "");
+        if (!["upload", "download"].includes(direction) || !["iwara", "han1"].includes(source) || !Array.isArray(body.files) || !body.files.length || body.files.length > 5000) {
+          reply(400, { error: "传输方向、来源或文件清单无效" }); return;
+        }
+        const repository = (scheduler.config.storageRepositories || []).find(item => item.enabled && item.id === body.repositoryId &&
+          item.source === source && item.roles.includes(direction === "upload" ? "receive" : "serve"));
+        if (!repository) { reply(409, { error: "指定仓库未启用或不支持该传输方向" }); return; }
+        const files = body.files.map(file => ({ source: String(file?.source || source), sourceId: String(file?.sourceId || ""),
+          taskId: String(file?.taskId || ""), role: String(file?.role || "media"), relativePath: String(file?.relativePath || file?.filename || ""),
+          size: Number(file?.size), sha256: String(file?.sha256 || "").toLowerCase(), repositoryId: repository.id }));
+        if (files.some(file => file.source !== source || !file.sourceId || !file.relativePath || file.relativePath.length > 512 ||
+            file.relativePath.includes("..") || file.relativePath.includes("\\") || !Number.isSafeInteger(file.size) || file.size < 0 ||
+            file.size > 4_500_000_000 || !/^[a-f0-9]{64}$/.test(file.sha256))) {
+          reply(400, { error: "文件清单含有无效路径、大小或 SHA-256" }); return;
+        }
+        const groupedFiles = new Map();
+        for (const file of files) {
+          if (!groupedFiles.has(file.sourceId)) groupedFiles.set(file.sourceId, []);
+          groupedFiles.get(file.sourceId).push(file);
+        }
+        const groups = []; let current = { files: [], totalBytes: 0 };
+        for (const [sourceId, groupFiles] of groupedFiles) {
+          const groupBytes = groupFiles.reduce((total, file) => total + file.size, 0);
+          if (!Number.isSafeInteger(groupBytes) || groupBytes > 4_500_000_000) {
+            reply(413, { error: `来源编号 ${sourceId} 的单个文件组超过批次硬上限` }); return;
+          }
+          if (current.files.length && current.totalBytes + groupBytes > 1024 ** 3) {
+            groups.push(current); current = { files: [], totalBytes: 0 };
+          }
+          current.files.push(...groupFiles); current.totalBytes += groupBytes;
+          if (groupBytes >= 1024 ** 3) { groups.push(current); current = { files: [], totalBytes: 0 }; }
+        }
+        if (current.files.length) groups.push(current);
+        const transfer = storageTransferStore.createTransfer({ direction, source, repositoryId: repository.id,
+          configVersion: storageConfig?.view().revision || "", requestKey: String(body.requestKey || "").slice(0, 160),
+          payload: { protocolVersion: 2 }, batches: groups.map((group, index) => ({ batchNo: index + 1, totalBytes: group.totalBytes, files: group.files })) });
+        reply(201, transfer);
+      } else if (request.method === "GET" && /^\/api\/mobile\/transfers\/[^/]+\/batches\/[^/]+\/archive$/.test(url.pathname)) {
+        if (!storageTransferStore) { reply(503, { error: "传输任务存储尚未启用" }); return; }
+        const match = /^\/api\/mobile\/transfers\/([^/]+)\/batches\/([^/]+)\/archive$/.exec(url.pathname);
+        const id = decodeURIComponent(match[1]); const batchId = decodeURIComponent(match[2]);
+        const transfer = storageTransferStore.getTransfer(id); const batch = transfer?.batches.find(item => item.id === batchId);
+        if (!transfer || !batch) { reply(404, { error: "传输任务或批次不存在" }); return; }
+        if (transfer.direction !== "download") { reply(409, { error: "该批次不是电脑到手机下载任务" }); return; }
+        try {
+          let prepared = batch.payload;
+          const currentJob = batchDownloadJobs.get(String(prepared.downloadId || ""));
+          if (!currentJob || currentJob.expiresAt <= Date.now()) {
+            const videosByTaskId = new Map(Object.entries(prepared.videosByTaskId || {}));
+            const regenerated = await prepareBatchDownload(prepared.taskIds || [], "", {
+              protocolVersion: 2, transferId: id, source: transfer.source, videosByTaskId
+            });
+            prepared = { ...prepared, ...regenerated, taskIds: prepared.taskIds,
+              videosByTaskId: Object.fromEntries(videosByTaskId) };
+            storageTransferStore.setBatchPayload(id, batchId, prepared);
+          }
+          response.writeHead(303, { location: prepared.url, "content-length": 0, "cache-control": "no-store" }); response.end();
+        } catch (error) { reply(error.statusCode || 409, { error: error.message || "本批文件不可恢复，请重新创建随机下载批次" }); }
+      } else if (request.method === "PUT" && /^\/api\/mobile\/transfers\/[^/]+\/batches\/[^/]+\/archive$/.test(url.pathname)) {
+        if (!storageTransferStore) { reply(503, { error: "传输任务存储尚未启用" }); return; }
+        const match = /^\/api\/mobile\/transfers\/([^/]+)\/batches\/([^/]+)\/archive$/.exec(url.pathname);
+        const id = decodeURIComponent(match[1]); const batchId = decodeURIComponent(match[2]);
+        const transfer = storageTransferStore.getTransfer(id);
+        const batch = transfer?.batches.find(item => item.id === batchId);
+        if (!transfer || !batch) { reply(404, { error: "传输任务或批次不存在" }); return; }
+        if (transfer.direction !== "upload" || transfer.source !== "han1") { reply(409, { error: "当前批次不支持 Han 文件上传" }); return; }
+        if (!/^application\/zip(?:\s*;|$)/i.test(String(request.headers["content-type"] || ""))) { reply(415, { error: "归档请求必须使用 application/zip" }); return; }
+        const repository = (scheduler.config.storageRepositories || []).find(item => item.id === transfer.repositoryId && item.enabled && item.source === "han1" && item.roles.includes("receive"));
+        if (!repository) { reply(409, { error: "传输目标仓库已经停用或不再可用" }); return; }
+        storageTransferStore.setBatchState(id, batchId, "transferring");
+        try {
+          const result = await receiveHan1meArchive(request, repository.path, { expectedTransferId: id, expectedFiles: batch.files });
+          if (result.manifestVersion !== 2 || result.transferId !== id) throw Object.assign(new Error("ZIP 清单未绑定当前 v2 传输任务"), { statusCode: 409 });
+          const expected = new Map(batch.files.map(file => [`${file.source}\u0000${file.sourceId}\u0000${file.role}\u0000${file.relativePath}\u0000${file.size}\u0000${file.sha256}`, file]));
+          if (result.files.length !== expected.size || result.files.some(file => !expected.has(`${file.source}\u0000${file.sourceId}\u0000${file.role}\u0000${file.relativePath}\u0000${file.size}\u0000${file.sha256}`))) {
+            throw Object.assign(new Error("已验证 ZIP 文件集合与本批冻结清单不同"), { statusCode: 409 });
+          }
+          await han1meImporter?.scan().catch(error => console.warn("Han 归档后入账扫描失败", error.message));
+          storageTransferStore.setBatchPayload(id, batchId, { ...batch.payload, archiveBytes: result.archiveBytes });
+          const receipts = result.files.map(file => ({ ...file, state: "saved" }));
+          const updated = storageTransferStore.confirmFiles(id, batchId, receipts);
+          reply(200, { ok: true, saved: true, indexed: false, transferId: id, batchId,
+            codes: result.codes, codeCount: result.codeCount, fileCount: result.fileCount,
+            archiveBytes: result.archiveBytes, files: receipts, transfer: updated });
+        } catch (error) {
+          try { storageTransferStore.setBatchState(id, batchId, "failed", String(error.message || "归档失败")); } catch {}
+          if (!response.headersSent) reply(error.statusCode || 400, { error: error.message || "归档失败", transfer: storageTransferStore.getTransfer(id) });
+          else response.destroy(error);
+        }
+      } else if (request.method === "GET" && /^\/api\/mobile\/transfers\/[^/]+$/.test(url.pathname)) {
+        if (!storageTransferStore) { reply(503, { error: "传输任务存储尚未启用" }); return; }
+        const id = decodeURIComponent(url.pathname.split("/").at(-1));
+        const transfer = storageTransferStore.getTransfer(id);
+        if (!transfer) { reply(404, { error: "传输任务不存在" }); return; }
+        if (transfer.direction === "upload") {
+          const saved = transfer.batches.flatMap(batch => batch.files).filter(file => file.state === "saved");
+          if (saved.length) {
+            await refreshInventory(saved);
+            const checked = storageTransferStore.checkInventory(saved);
+            const receipts = checked.filter(item => item.status === "present").map(item => ({ ...item, state: "indexed", role: item.role,
+              relativePath: transfer.batches.flatMap(batch => batch.files).find(file => file.source === item.source &&
+                file.sourceId === item.sourceId && file.taskId === item.taskId && file.role === item.role &&
+                file.size === item.size && file.sha256 === item.sha256)?.relativePath || "" }));
+            for (const batch of transfer.batches) {
+              const batchReceipts = receipts.filter(item => batch.files.some(file => file.source === item.source && file.sourceId === item.sourceId && file.role === item.role && file.relativePath === item.relativePath));
+              if (batchReceipts.length) storageTransferStore.confirmFiles(id, batch.id, batchReceipts);
+            }
+          }
+        }
+        reply(200, storageTransferStore.getTransfer(id));
+      } else if (request.method === "POST" && /^\/api\/mobile\/transfers\/[^/]+\/batches\/[^/]+\/confirm$/.test(url.pathname)) {
+        if (!storageTransferStore) { reply(503, { error: "传输任务存储尚未启用" }); return; }
+        const match = /^\/api\/mobile\/transfers\/([^/]+)\/batches\/([^/]+)\/confirm$/.exec(url.pathname);
+        const id = decodeURIComponent(match[1]); const batchId = decodeURIComponent(match[2]);
+        const transfer = storageTransferStore.getTransfer(id);
+        if (!transfer) { reply(404, { error: "传输任务不存在" }); return; }
+        const body = await readJson(request, 2 * 1024 * 1024);
+        if (!Array.isArray(body.files) || body.files.length > 5000) { reply(400, { error: "文件确认清单无效" }); return; }
+        let receipts = body.files;
+        if (transfer.direction === "upload") {
+          await refreshInventory(receipts);
+          const checked = storageTransferStore.checkInventory(receipts);
+          receipts = checked.map(item => ({ ...item, role: item.role,
+            relativePath: body.files.find(file => file.source === item.source && file.sourceId === item.sourceId &&
+              file.taskId === item.taskId && file.role === item.role && file.size === item.size && file.sha256 === item.sha256)?.relativePath || "",
+            state: item.status === "present" ? "indexed" : item.status === "conflict" ? "conflict" : "saved",
+            error: item.reason || "" }));
+        }
+        reply(200, storageTransferStore.confirmFiles(id, batchId, receipts));
+      } else if (request.method === "POST" && /^\/api\/mobile\/transfers\/[^/]+\/cancel$/.test(url.pathname)) {
+        if (!storageTransferStore) { reply(503, { error: "传输任务存储尚未启用" }); return; }
+        const id = decodeURIComponent(url.pathname.split("/").at(-2));
+        const result = storageTransferStore.cancelTransfer(id);
+        if (!result) { reply(404, { error: "传输任务不存在或已完成" }); return; }
+        reply(200, result);
+      } else if (request.method === "GET" && url.pathname === "/") {
         const body = dashboardHtml();
         response.writeHead(200, {
           "content-type": "text/html; charset=utf-8",
@@ -1755,7 +2117,35 @@ export function createServer({ scheduler, host, port, accessToken = "", ffmpeg =
         if (request.method === 'HEAD') response.end();
         else pipeMediaFile(response, file);
       } else if (request.method === "GET" && url.pathname === "/api/status") {
-        reply(200, { ...scheduler.status(), mobileLibrary: mobileLibrary?.status() || null, han1meImport: han1meImporter?.status() || null });
+        const backup = scheduler.store?.backupManager?.status?.() || null;
+        const fingerprint = mobileLibrary?.status?.() || null;
+        const repositoryStatus = await Promise.all((scheduler.config.storageRepositories || []).map(async item => {
+          let available = false;
+          try { available = (await stat(item.path)).isDirectory(); } catch {}
+          return { id: item.id, name: item.name, source: item.source, enabled: item.enabled,
+            roles: item.roles, available };
+        }));
+        reply(200, {
+          ...scheduler.status(),
+          mobileLibrary: fingerprint,
+          han1meImport: han1meImporter?.status() || null,
+          storageSync: {
+            configRevision: storageConfig?.view().revision || "",
+            pendingRestart: Boolean(storageConfig?.view().pendingRestart),
+            repositories: repositoryStatus,
+            transfers: storageTransferStore?.summary?.() || null,
+            fingerprints: fingerprint ? {
+              running: Boolean(fingerprint.running), ready: Number(fingerprint.ready || 0),
+              pending: Number(fingerprint.pending || 0), failed: Number(fingerprint.failed || 0),
+              bytesHashed: Number(fingerprint.bytesHashed || 0),
+            } : null,
+            backup: backup ? {
+              running: Boolean(backup.running), date: backup.date || null,
+              lastAttemptAt: backup.lastAttemptAt || null, lastSuccessAt: backup.lastSuccessAt || null,
+              failed: Boolean(backup.error),
+            } : null,
+          }
+        });
       } else if (request.method === "GET" && url.pathname === "/api/ledger") {
         reply(200, scheduler.ledger({
           query: url.searchParams.get("query") || "",

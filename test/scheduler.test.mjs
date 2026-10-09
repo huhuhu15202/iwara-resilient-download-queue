@@ -210,6 +210,33 @@ describe("download disk reserve and fallback", () => {
       assert.equal(currentTask.destination, path.join(fallback, "retry.mp4"));
     } finally { await rm(root, { recursive: true, force: true }); }
   });
+
+  test("concurrent finalization reservations share free space by physical volume", async () => {
+    const root = await tempRoot("iwara-shared-reserve-");
+    try {
+      const primary = path.join(root, "J", "Video");
+      const fallback = path.join(root, "F", "Video");
+      const { current } = scheduler([], {
+        root,
+        downloadRoot: primary,
+        fallbackDownloadRoot: fallback,
+        stagingRoot: path.join(root, "C", "staging"),
+        downloadMinimumFreeBytes: 5 * 1024 ** 3,
+        diskSpaceProvider: async drive => drive === primary || drive === fallback ? 10 * 1024 ** 3 : 0,
+        volumeKeyProvider: value => value.includes(`${path.sep}J${path.sep}`) || value.includes(`${path.sep}F${path.sep}`)
+          ? "shared-volume" : "staging-volume"
+      });
+      const first = task({ id: "reserve-one", resolved: { relativePath: "one.mp4" } });
+      const second = task({ id: "reserve-two", resolved: { relativePath: "two.mp4" } });
+      const firstDestination = await current.chooseDownloadDestination(first, 4 * 1024 ** 3);
+      const secondDestination = await current.chooseDownloadDestination(second, 4 * 1024 ** 3);
+
+      assert.equal(firstDestination, path.join(primary, "one.mp4"));
+      assert.equal(secondDestination, "");
+      assert.equal(current.destinationReservations.get(first.id)?.bytes, 4 * 1024 ** 3);
+      assert.equal(current.destinationReservations.has(second.id), false);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
 });
 
 async function fileInfoForTest(filePath) {
@@ -1244,6 +1271,41 @@ describe("scheduler state transitions", () => {
       assert.equal(currentTask.fileStatus, "present");
       assert.equal(currentTask.destination, moved);
       assert.ok(currentTask.pathReconciledAt);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  test("media reconciliation verifies Han1 media inside Han repositories", async () => {
+    const root = await tempRoot("iwara-han-media-reconcile-");
+    try {
+      const hanRoot = path.join(root, "han-history");
+      const iwaraRoot = path.join(root, "iwara");
+      const media = path.join(hanRoot, "405616", "video.mp4");
+      await mkdir(path.dirname(media), { recursive: true });
+      await writeFile(media, Buffer.concat([Buffer.from([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70]), Buffer.alloc(2048)]));
+      const hanTask = task({
+        id: "han-reconcile-task",
+        videoId: "han1meview-405616",
+        sourcePlatform: "han1meview",
+        sourcePage: "",
+        state: "completed",
+        destination: media,
+        totalLength: "2056",
+        fileStatus: "missing"
+      });
+      const { current } = scheduler([hanTask], {
+        root,
+        downloadRoot: iwaraRoot,
+        storageRepositories: [
+          { id: "iwara", name: "Iwara", path: iwaraRoot, source: "iwara", enabled: true, roles: ["download", "scan", "serve"], priority: 10 },
+          { id: "han", name: "Han", path: hanRoot, source: "han1", enabled: true, roles: ["scan", "serve"], priority: 20 }
+        ]
+      });
+
+      await current.verifyCompletedTask(hanTask);
+
+      assert.equal(hanTask.fileStatus, "present");
+      assert.equal(hanTask.destination, media);
+      assert.equal((await current.playlist({ source: "han1" })).total, 1);
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 

@@ -22,9 +22,30 @@ public final class VideoScanner {
     public VideoScanner(Context context, LibraryDb db, AtomicBoolean cancelled) { this.context = context.getApplicationContext(); this.resolver = context.getContentResolver(); this.db = db; this.cancelled = cancelled; }
     private void check() throws InterruptedException { if (cancelled.get() || Thread.currentThread().isInterrupted()) throw new InterruptedException("扫描已暂停"); }
     public void scan(Uri directory, Progress progress) throws Exception {
+        if (directory == null) { scanRoots(java.util.Collections.emptyList(), true, progress); return; }
+        List<LibraryDb.ScanRoot> roots = new ArrayList<>(); roots.add(new LibraryDb.ScanRoot(directory.toString(), "视频目录"));
+        scanRoots(roots, false, progress);
+    }
+    /** Scans all authorized roots under one discovery session. A failed or revoked root
+     * aborts before finishDiscovery, so files in earlier roots are never marked missing. */
+    public void scanRoots(List<LibraryDb.ScanRoot> roots, boolean mediaStore, Progress progress) throws Exception {
         long session = System.currentTimeMillis();
-        if (directory == null) scanMediaStore(session); else scanTree(directory, session);
-        check(); db.finishDiscovery(session); progress.changed("已扫描文件，正在匹配资料…", true);
+        List<String> activeRootKeys = new ArrayList<>();
+        boolean usingMediaStore = roots == null || roots.isEmpty();
+        if (usingMediaStore) {
+            if (mediaStore) scanMediaStore(session);
+            else throw new IllegalStateException("尚未添加可扫描的视频文件夹");
+        } else {
+            java.util.HashSet<String> scanned = new java.util.HashSet<>();
+            for (LibraryDb.ScanRoot root : roots) {
+                check();
+                Uri tree = Uri.parse(root.uri);
+                String key = StorageAccess.treeOf(tree) == null ? root.uri : StorageAccess.treeOf(tree).toString();
+                if (scanned.add(key)) { scanTree(tree, session, key); activeRootKeys.add(key); }
+                progress.changed("正在扫描 " + root.label, false);
+            }
+        }
+        check(); db.finishDiscovery(session, activeRootKeys, usingMediaStore); progress.changed("已扫描文件，正在匹配资料…", true);
         match(progress);
     }
     private void scanMediaStore(long session) throws Exception {
@@ -32,10 +53,10 @@ public final class VideoScanner {
         String[] columns = {MediaStore.Video.Media._ID, MediaStore.Video.Media.DISPLAY_NAME, MediaStore.Video.Media.SIZE, MediaStore.Video.Media.DATE_MODIFIED};
         try (Cursor rows = resolver.query(collection, columns, null, null, null)) {
             if (rows == null) throw new IllegalStateException("无法读取媒体库");
-            while (rows.moveToNext()) { check(); db.discovered(ContentUris.withAppendedId(collection, rows.getLong(0)).toString(), rows.getString(1), rows.getLong(2), rows.getLong(3) * 1000, session); }
+            while (rows.moveToNext()) { check(); db.discovered(ContentUris.withAppendedId(collection, rows.getLong(0)).toString(), rows.getString(1), rows.getLong(2), rows.getLong(3) * 1000, session, "media"); }
         }
     }
-    private void scanTree(Uri tree, long session) throws Exception {
+    private void scanTree(Uri tree, long session, String scanRoot) throws Exception {
         ArrayDeque<String> pending = new ArrayDeque<>(); pending.push(DocumentsContract.getTreeDocumentId(tree));
         String[] columns = {DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME, DocumentsContract.Document.COLUMN_MIME_TYPE, DocumentsContract.Document.COLUMN_SIZE, DocumentsContract.Document.COLUMN_LAST_MODIFIED};
         while (!pending.isEmpty()) {
@@ -46,7 +67,7 @@ public final class VideoScanner {
                     check(); String id = rows.getString(0), name = rows.getString(1), mime = rows.getString(2);
                     if (DocumentsContract.Document.MIME_TYPE_DIR.equals(mime)) pending.push(id);
                     else if ((mime != null && mime.startsWith("video/")) || (name != null && name.toLowerCase(java.util.Locale.ROOT).matches(".*\\.(mp4|mkv|webm|mov|avi|m4v)$")))
-                        db.discovered(DocumentsContract.buildDocumentUriUsingTree(tree, id).toString(), name, rows.isNull(3) ? -1 : rows.getLong(3), rows.getLong(4), session);
+                        db.discovered(DocumentsContract.buildDocumentUriUsingTree(tree, id).toString(), name, rows.isNull(3) ? -1 : rows.getLong(3), rows.getLong(4), session, scanRoot);
                 }
             }
         }

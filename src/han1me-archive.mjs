@@ -87,8 +87,13 @@ async function extractEntry(zip, entry, destination, limits) {
 }
 
 function validateManifest(manifest, files, { compareHashes = true } = {}) {
-  if (!manifest || manifest.type !== "han1meviewer-archive" || manifest.version !== 1 || !Array.isArray(manifest.videos) || !Array.isArray(manifest.files)) {
+  if (!manifest || manifest.type !== "han1meviewer-archive" || ![1, 2].includes(manifest.version) || !Array.isArray(manifest.videos) || !Array.isArray(manifest.files)) {
     throw archiveError(400, "归档清单格式不受支持");
+  }
+  if (manifest.version === 2 && (!/^[a-f0-9-]{36}$/i.test(manifest.transferId || "") || manifest.files.some(file =>
+      !["han1", "iwara"].includes(file.source) || !String(file.sourceId || "") ||
+      !["media", "cover", "metadata"].includes(file.role)))) {
+    throw archiveError(400, "v2 归档缺少有效的传输或逐文件来源身份");
   }
   if (manifest.videos.length < 1 || manifest.videos.length > MAX_CODE_COUNT || manifest.files.length !== files.length) {
     throw archiveError(400, "归档清单中的视频或文件数量无效");
@@ -176,7 +181,7 @@ async function commitFiles(root, staging, codes, extractedFiles) {
     targetPaths.add(targetKey);
     const targetInfo = await exists(target);
     if (!targetInfo) {
-      plan.push({ source, target, action: "move" });
+      plan.push({ source, target, action: "move", file });
       continue;
     }
     if (!targetInfo.isFile() || targetInfo.isSymbolicLink()) {
@@ -185,14 +190,12 @@ async function commitFiles(root, staging, codes, extractedFiles) {
     const targetHash = await sha256File(target);
     if (targetHash.size === file.size && targetHash.sha256 === file.sha256) {
       alreadyPresentCount += 1;
-      plan.push({ source, target, action: "skip" });
+      plan.push({ source, target, action: "skip", file });
       continue;
     }
     const extension = path.extname(relativeName).toLowerCase();
     if (extension === ".png" || relativeName.toLowerCase() === "info.json") {
-      preservedSidecarCount += 1;
-      plan.push({ source, target, action: "preserve" });
-      continue;
+      throw archiveError(409, `电脑上已有同名但内容不同的资料文件 ${file.path}；为避免丢弃新 JSON 或封面，未确认本批归档`);
     }
     throw archiveError(409, `电脑上已有同名但内容不同的视频 ${file.path}，未覆盖任何内容`);
   }
@@ -202,7 +205,18 @@ async function commitFiles(root, staging, codes, extractedFiles) {
     if (item.action === "move") await rename(item.source, item.target);
     else await rm(item.source, { force: true });
   }
-  return { alreadyPresentCount, preservedSidecarCount, addedFileCount: plan.filter(item => item.action === "move").length };
+  return { alreadyPresentCount, preservedSidecarCount, addedFileCount: plan.filter(item => item.action === "move").length,
+    files: plan.map(item => ({
+      source: item.file.source || "han1",
+      sourceId: String(item.file.sourceId || item.file.path.split("/")[0]),
+      taskId: item.file.taskId || "",
+      role: item.file.role || (MEDIA_EXTENSIONS.has(path.extname(item.file.path).toLowerCase()) ? "media" : path.extname(item.file.path).toLowerCase() === ".png" ? "cover" : "metadata"),
+      relativePath: item.file.path,
+      filename: path.basename(item.target),
+      size: item.file.size,
+      sha256: item.file.sha256,
+      state: "saved"
+    })) };
 }
 
 async function commitFilesSerially(root, staging, codes, extractedFiles) {
@@ -229,7 +243,7 @@ async function saveRequestBody(request, destination, maximumBytes) {
   return bytes;
 }
 
-export async function receiveHan1meArchive(request, configuredRoot) {
+export async function receiveHan1meArchive(request, configuredRoot, { expectedTransferId = "", expectedFiles = null } = {}) {
   if (!configuredRoot) throw archiveError(503, "Han1me 视频目录未配置");
   const root = path.resolve(configuredRoot);
   await mkdir(root, { recursive: true });
@@ -282,6 +296,16 @@ export async function receiveHan1meArchive(request, configuredRoot) {
     let manifest;
     try { manifest = JSON.parse(manifestText); }
     catch { throw archiveError(400, "manifest.json 不是有效 JSON"); }
+    if (expectedTransferId && (manifest.version !== 2 || manifest.transferId !== expectedTransferId)) {
+      throw archiveError(409, "ZIP 清单未绑定当前 v2 传输任务");
+    }
+    if (Array.isArray(expectedFiles)) {
+      const incoming = new Map(manifest.files.map(file => [`${file.source}\u0000${file.sourceId}\u0000${file.role}\u0000${file.path}\u0000${file.size}\u0000${file.sha256}`, file]));
+      if (incoming.size !== expectedFiles.length || expectedFiles.some(file =>
+          !incoming.has(`${file.source}\u0000${file.sourceId}\u0000${file.role}\u0000${file.relativePath}\u0000${file.size}\u0000${file.sha256}`))) {
+        throw archiveError(409, "ZIP 文件集合与冻结的传输批次不同");
+      }
+    }
     const payloadEntries = archiveEntries.filter(({ safe }) => !safe.manifest);
     const codes = validateManifest(manifest, payloadEntries.map(({ entry }) => ({
       path: entry.fileName,
@@ -294,10 +318,14 @@ export async function receiveHan1meArchive(request, configuredRoot) {
       extractedFiles.push(await extractEntry(zip, entry, destination, extractedLimits));
     }
     validateManifest(manifest, extractedFiles);
+    const manifestFiles = new Map(manifest.files.map(file => [file.path, file]));
+    for (const file of extractedFiles) Object.assign(file, manifestFiles.get(file.path) || {});
     await mkdir(rootReal, { recursive: true });
     const committed = await commitFilesSerially(rootReal, stagingRoot, codes, extractedFiles);
     return {
       ok: true,
+      manifestVersion: manifest.version,
+      transferId: manifest.version === 2 ? manifest.transferId : "",
       codes,
       codeCount: codes.length,
       archiveBytes,

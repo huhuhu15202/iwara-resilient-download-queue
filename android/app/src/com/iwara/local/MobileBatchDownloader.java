@@ -83,10 +83,28 @@ public final class MobileBatchDownloader {
             JSONObject manifest;
             try { manifest = new JSONObject(new String(manifestBytes, java.nio.charset.StandardCharsets.UTF_8)); }
             catch (Exception error) { throw new IOException("随机下载清单无效", error); }
-            if (!"iwara-mobile-random-batch".equals(manifest.optString("type")) || manifest.optInt("version") != 1)
+            int manifestVersion = manifest.optInt("version");
+            String transferId = manifest.optString("transferId", "");
+            if (!"iwara-mobile-random-batch".equals(manifest.optString("type")) || (manifestVersion != 1 && manifestVersion != 2)
+                    || manifestVersion == 2 && !transferId.matches("[a-f0-9-]{36}"))
                 throw new IOException("随机下载包版本不支持");
             JSONArray videos = manifest.optJSONArray("videos");
             if (videos == null || videos.length() < 1 || videos.length() > 100) throw new IOException("随机下载包的视频数量无效");
+            JSONArray manifestFiles = manifestVersion == 2 ? manifest.optJSONArray("files") : null;
+            if (manifestVersion == 2 && (manifestFiles == null || manifestFiles.length() != videos.length())) throw new IOException("v2 随机下载包缺少逐文件校验清单");
+            Map<String, JSONObject> filesByEntry = new HashMap<>();
+            if (manifestFiles != null) {
+                for (int i = 0; i < manifestFiles.length(); i++) {
+                    JSONObject file = manifestFiles.getJSONObject(i);
+                    String entryName = file.optString("path", "");
+                    if (!"media".equals(file.optString("role")) || !entryName.startsWith("media/")
+                            || entryName.contains("..") || entryName.contains("\\")
+                            || !file.optString("sourceId", "").matches("[A-Za-z0-9._:-]{1,256}")
+                            || !file.optString("sha256", "").matches("[a-f0-9]{64}")
+                            || file.optLong("size", -1) <= 0 || filesByEntry.put(entryName, file) != null)
+                        throw new IOException("v2 随机下载清单的媒体身份无效");
+                }
+            }
             Map<String, JSONObject> byEntry = new HashMap<>();
             Set<String> taskIds = new HashSet<>();
             for (int i = 0; i < videos.length(); i++) {
@@ -107,6 +125,12 @@ public final class MobileBatchDownloader {
                 for (int tagIndex = 0; tagIndex < tags.length(); tagIndex++) {
                     if (!(tags.get(tagIndex) instanceof String) || tags.getString(tagIndex).length() > 160)
                         throw new IOException("随机下载标签数据无效");
+                }
+                if (manifestVersion == 2) {
+                    JSONObject file = filesByEntry.get(entryName);
+                    if (file == null || file.optLong("size", -1) != size || !file.optString("sha256").equals(video.optString("sha256"))
+                            || !file.optString("source").equals(source) || !file.optString("sourceId").equals(video.optString("sourceId"))
+                            || !file.optString("taskId").equals(taskId)) throw new IOException("视频资料与逐文件校验清单不一致");
                 }
                 if (byEntry.put(entryName, video) != null) throw new IOException("随机下载清单中有重复文件");
             }
@@ -150,6 +174,8 @@ public final class MobileBatchDownloader {
                 zip.verifyDescriptor(entry, entry.computedCrc);
                 entry.crc = entry.computedCrc;
                 output.sha256 = hex(digest.digest()); output.size = entry.size; output.video = video;
+                if (manifestVersion == 2 && !output.sha256.equals(video.optString("sha256")))
+                    throw new IOException("视频 SHA-256 与电脑清单不一致，已拒绝写入台账：" + video.optString("name"));
                 entries.add(entry);
             }
             if (entries.size() != videos.length() + 1) throw new IOException("随机下载包中的视频数量不完整");
@@ -238,7 +264,7 @@ public final class MobileBatchDownloader {
     private void checkCancelled() throws InterruptedException { if (cancelled.get() || Thread.currentThread().isInterrupted()) throw new InterruptedException("随机下载已取消"); }
 
     private final class PendingOutput {
-        Uri uri, promotedUri;
+        Uri uri, promotedUri, pendingTargetUri;
         final boolean mediaStore;
         String finalName, sha256;
         JSONObject video;
@@ -256,20 +282,23 @@ public final class MobileBatchDownloader {
                 if (promotedUri == null) {
                     Uri tree=StorageAccess.treeOf(selectedTree); String treeId=DocumentsContract.getTreeDocumentId(tree);
                     Uri parent=DocumentsContract.buildDocumentUriUsingTree(tree,treeId);
-                    promotedUri=DocumentsContract.createDocument(resolver,parent,mime(finalName),finalName);
-                    if (promotedUri == null) throw new IOException("文件夹不支持改名，也无法创建正式视频文件");
-                    try (InputStream input=resolver.openInputStream(uri); OutputStream output=resolver.openOutputStream(promotedUri,"w")) {
+                    pendingTargetUri=DocumentsContract.createDocument(resolver,parent,mime(finalName),finalName);
+                    if (pendingTargetUri == null) throw new IOException("文件夹不支持改名，也无法创建正式视频文件");
+                    try (InputStream input=resolver.openInputStream(uri); OutputStream output=resolver.openOutputStream(pendingTargetUri,"w")) {
                         if(input==null||output==null)throw new IOException("无法发布完整视频文件");
                         byte[] buffer=new byte[128*1024];int length;while((length=input.read(buffer))!=-1){if(cancelled.get())throw new InterruptedException("随机下载已取消");output.write(buffer,0,length);}
                     }
                     try { DocumentsContract.deleteDocument(resolver,uri); } catch(Exception ignored) {}
-                    uri=promotedUri;
+                    uri=pendingTargetUri;promotedUri=pendingTargetUri;pendingTargetUri=null;
                 } else uri=promotedUri;
             }
         }
         void deleteQuietly() {
-            deleteUri(uri);
-            if (promotedUri != null && !promotedUri.equals(uri)) deleteUri(promotedUri);
+            // Once a final filename has been published, keep it even if the
+            // Room transaction or post-write verification fails. It is safer
+            // to show an unindexed local file than to silently erase it.
+            if (promotedUri == null) deleteUri(uri);
+            if (pendingTargetUri != null) deleteUri(pendingTargetUri);
         }
         private void deleteUri(Uri target) {
             if (target == null) return;
