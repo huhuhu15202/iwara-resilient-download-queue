@@ -22,6 +22,7 @@
 
 ## Implementation and verification
 
+- The desktop entry runs Windows PowerShell 5.1. Keep `start.ps1` encoded as UTF-8 with BOM, and read JSON explicitly with `-Encoding UTF8`. Verify using the actual `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`; the terminal tool may use PowerShell 7 even when a different shell is requested.
 - Keep legacy v1 clients and response fields compatible when changing sync APIs; update the shared contract before changing protocol meaning.
 - Distinguish download history, current file inventory, and completed ledger/import state. A matching ID alone is not proof that a file is present or safely archived.
 - For transfers, use stable task/batch IDs and verify actual file length and SHA-256 before claiming success or allowing cleanup.

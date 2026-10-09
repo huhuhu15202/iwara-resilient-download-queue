@@ -1,4 +1,4 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 $appRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $launcherErrorLog = Join-Path $appRoot "launcher-error.log"
 function Get-SafeLauncherFailureMessage {
@@ -40,7 +40,7 @@ $examplePath = Join-Path $appRoot "config.example.json"
 $dataRoot = if ($env:IWARA_DATA_ROOT) { $env:IWARA_DATA_ROOT } else { $null }
 if (Test-Path -LiteralPath $configPath) {
     try {
-        $localConfig = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+        $localConfig = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
         if ($localConfig.dataRoot -and -not $env:IWARA_DATA_ROOT) { $dataRoot = [string]$localConfig.dataRoot }
     } catch {
         throw (Get-SafeLauncherFailureMessage -Message "Unable to read config file ${configPath}: $($_.Exception.Message)")
@@ -48,7 +48,7 @@ if (Test-Path -LiteralPath $configPath) {
 }
 if (-not $dataRoot -and (Test-Path -LiteralPath $examplePath)) {
     try {
-        $exampleConfig = Get-Content -LiteralPath $examplePath -Raw | ConvertFrom-Json
+        $exampleConfig = Get-Content -LiteralPath $examplePath -Raw -Encoding UTF8 | ConvertFrom-Json
         $dataRoot = [string]$exampleConfig.dataRoot
     } catch {
         throw (Get-SafeLauncherFailureMessage -Message "Unable to read example config ${examplePath}: $($_.Exception.Message)")
@@ -61,7 +61,7 @@ if (-not $env:IWARA_CONFIG_PATH -and -not (Test-Path -LiteralPath $configPath)) 
         $configPath = $legacyConfigPath
         if (-not $env:IWARA_DATA_ROOT) {
             try {
-                $legacyConfig = Get-Content -LiteralPath $legacyConfigPath -Raw | ConvertFrom-Json
+                $legacyConfig = Get-Content -LiteralPath $legacyConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
                 if ($legacyConfig.dataRoot) { $dataRoot = [string]$legacyConfig.dataRoot }
             } catch {
                 throw (Get-SafeLauncherFailureMessage -Message "Unable to read legacy config file ${legacyConfigPath}: $($_.Exception.Message)")
@@ -118,7 +118,11 @@ for ($attempt = 0; $attempt -lt $maxStartupAttempts; $attempt++) {
 }
 
 if ($ready) {
-    Start-Process "http://127.0.0.1:18777/playlist"
+    try {
+        Start-Process -FilePath "http://127.0.0.1:18777/playlist" -ErrorAction Stop
+    } catch {
+        throw "本地服务已经启动，但无法打开浏览器。请检查 Windows 的 HTTP 浏览器关联，或手动打开本地播放列表。"
+    }
 } else {
     $failureMessage = "Iwara queue failed to start. See:"
     if ($serviceProcess -and $serviceProcess.HasExited) {
